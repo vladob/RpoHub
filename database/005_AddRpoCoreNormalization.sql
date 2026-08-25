@@ -96,7 +96,7 @@ BEGIN
 		CREATE TABLE [#Pending]
 		(
 			[RawRecordId]		bigint			NOT NULL CONSTRAINT [PK_Pending] PRIMARY KEY,
-			[SourceEntityId]	varchar(100)	NOT NULL,
+			[SourceEntityId]	varchar(100) COLLATE DATABASE_DEFAULT NOT NULL,
 			[JsonData]			varchar(max) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
 			[DisplayName]		nvarchar(1000)	NULL
 		);
@@ -112,9 +112,9 @@ BEGIN
 		OUTER APPLY
 		(
 			SELECT TOP (1)
-				CONVERT(nvarchar(1000), JSON_VALUE([name].[value], '$.value')) AS [NameValue]
+				CONVERT(nvarchar(1000), JSON_VALUE([name].[value], '$.value')) COLLATE DATABASE_DEFAULT AS [NameValue]
 			FROM OPENJSON([raw].[JsonData], '$.fullNames') AS [name]
-			WHERE NULLIF(JSON_VALUE([name].[value], '$.value'), '') IS NOT NULL
+			WHERE NULLIF(JSON_VALUE([name].[value], '$.value') COLLATE DATABASE_DEFAULT, '') IS NOT NULL
 			ORDER BY
 				CASE WHEN JSON_VALUE([name].[value], '$.validTo') IS NULL THEN 0 ELSE 1 END,
 				TRY_CONVERT(date, JSON_VALUE([name].[value], '$.validFrom')) DESC,
@@ -139,7 +139,7 @@ BEGIN
 		CREATE TABLE [#SubjectMap]
 		(
 			[RawRecordId]		bigint			NOT NULL CONSTRAINT [PK_SubjectMap] PRIMARY KEY,
-			[SourceEntityId]	varchar(100)	NOT NULL,
+			[SourceEntityId]	varchar(100) COLLATE DATABASE_DEFAULT NOT NULL,
 			[SubjectId]			uniqueidentifier NOT NULL
 		);
 
@@ -248,7 +248,7 @@ BEGIN
 		CROSS APPLY
 		(
 			SELECT
-				CONVERT(nvarchar(100), JSON_VALUE([jsonIdentifier].[value], '$.value')) AS [IdentifierValue],
+				CONVERT(nvarchar(100), JSON_VALUE([jsonIdentifier].[value], '$.value')) COLLATE DATABASE_DEFAULT AS [IdentifierValue],
 				TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validFrom')) AS [ValidFrom],
 				TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validTo')) AS [ValidTo]
 		) AS [identifier]
@@ -285,7 +285,7 @@ BEGIN
 		CROSS APPLY
 		(
 			SELECT
-				CONVERT(nvarchar(1000), JSON_VALUE([jsonName].[value], '$.value')) AS [NameValue],
+				CONVERT(nvarchar(1000), JSON_VALUE([jsonName].[value], '$.value')) COLLATE DATABASE_DEFAULT AS [NameValue],
 				TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validFrom')) AS [ValidFrom],
 				TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validTo')) AS [ValidTo]
 		) AS [name]
