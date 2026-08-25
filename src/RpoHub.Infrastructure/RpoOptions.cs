@@ -9,4 +9,6 @@ public sealed class RpoOptions
     public string DailyPrefix { get; set; } = "batch-daily/";
     public TimeSpan DiscoveryInterval { get; set; } = TimeSpan.FromHours(24);
     public TimeSpan InitializationPollInterval { get; set; } = TimeSpan.FromSeconds(30);
+    public int NormalizationBatchSize { get; set; } = 5000;
+    public TimeSpan NormalizationPollInterval { get; set; } = TimeSpan.FromSeconds(30);
 }

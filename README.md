@@ -23,6 +23,8 @@ After running `database/003_AddImportFileExecutionState.sql`, `POST /api/import/
 
 The Worker automatically resumes a `Started` initialization batch, importing one file at a time. A database application lock plus the persisted `Importing` status prevents concurrent Web and Worker claims.
 
+After running `database/005_AddRpoCoreNormalization.sql`, the Worker normalizes the completed initialization snapshot in bounded, restartable batches. The first normalization slice creates one subject per RPO source entity, records the source entity ID and all IČO validity periods, preserves every historical name in `registry.SubjectName`, and selects the current or latest name for `registry.Subject.DisplayName`. Registry changes and `raw.SourceRecord.NormalizedAtUtc` are committed atomically for each batch.
+
 ## First run
 
 1. Install the .NET 8 SDK and SQL Server.
@@ -50,4 +52,4 @@ The worker never assumes that missing ETL metadata means an empty database. Init
 
 ## Next vertical slice
 
-Implement streaming `.json.gz` download into `raw.SourceRecord`, using a bounded batch and `SqlBulkCopy`, then normalize names and identifiers. The old `PgDumpImporter` project remains useful as a reference for sequential streaming, progress, cancellation, and bulk-copy patterns—not for its PostgreSQL COPY parser.
+Normalize legal forms, establishment and termination dates, addresses, activities, and organization-unit relationships. The old `PgDumpImporter` project remains useful as a reference for sequential streaming, progress, cancellation, and bulk-copy patterns—not for its PostgreSQL COPY parser.

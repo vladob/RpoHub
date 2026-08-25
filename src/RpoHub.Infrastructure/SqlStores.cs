@@ -156,3 +156,27 @@ public sealed class SqlRawRecordStore(string connectionString) : IRawRecordStore
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 }
+
+public sealed class SqlRpoCoreNormalizer(string connectionString) : IRpoCoreNormalizer
+{
+    public async Task<RpoNormalizationBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new SqlCommand("[etl].[NormalizeRpoCoreBatch]", connection)
+        {
+            CommandType = System.Data.CommandType.StoredProcedure,
+            CommandTimeout = 300
+        };
+        command.Parameters.Add("@BatchSize", System.Data.SqlDbType.Int).Value = batchSize;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+        return new RpoNormalizationBatchResult(
+            reader.GetInt32(0),
+            reader.GetInt32(1),
+            reader.GetInt32(2),
+            reader.GetInt32(3),
+            reader.GetBoolean(4));
+    }
+}

@@ -5,4 +5,5 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddRpoHubInfrastructure(builder.Configuration);
 builder.Services.AddHostedService<UpdateDiscoveryWorker>();
 builder.Services.AddHostedService<InitializationImportWorker>();
+builder.Services.AddHostedService<RpoNormalizationWorker>();
 await builder.Build().RunAsync();

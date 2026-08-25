@@ -29,6 +29,12 @@ public sealed record InitializationFileImportResult(
     long RowsInserted,
     string Status,
     bool BatchCompleted);
+public sealed record RpoNormalizationBatchResult(
+    int NormalizedRecords,
+    int InsertedSubjects,
+    int InsertedIdentifiers,
+    int InsertedNames,
+    bool LockUnavailable);
 
 public interface IRpoApiClient
 {
@@ -59,6 +65,11 @@ public interface IInitializationFileImporter
 {
     Task<InitializationFileImportResult> ImportNextAsync(Guid batchId, CancellationToken cancellationToken);
     Task<InitializationFileImportResult?> ImportNextStartedBatchAsync(CancellationToken cancellationToken);
+}
+
+public interface IRpoCoreNormalizer
+{
+    Task<RpoNormalizationBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken);
 }
 
 public sealed class DiscoverRpoUpdates(IRpoExportCatalog catalog, IImportStateStore stateStore)
