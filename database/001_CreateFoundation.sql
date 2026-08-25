@@ -113,7 +113,7 @@ CREATE TABLE [registry].[SubjectIdentifier]
 	[IsVerified]				bit						NOT NULL CONSTRAINT [DF_SubjectIdentifier_Verified] DEFAULT 0,
 	[FirstObservedAtUtc]		datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectIdentifier_First] DEFAULT SYSUTCDATETIME(),
 	[LastObservedAtUtc]			datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectIdentifier_Last] DEFAULT SYSUTCDATETIME(),
-	CONSTRAINT [UQ_SubjectIdentifier_Attribution] UNIQUE ([SubjectId], [IdentifierTypeCode], [IdentifierValue], [SourceCode], [ValidFrom])
+	CONSTRAINT [UQ_SubjectIdentifier_Attribution] UNIQUE ([SubjectId], [IdentifierTypeCode], [IdentifierValue], [SourceCode], [ValidFrom], [ValidTo])
 );
 CREATE INDEX [IX_SubjectIdentifier_Lookup] ON [registry].[SubjectIdentifier] ([IdentifierTypeCode], [IdentifierValue]) INCLUDE ([SubjectId], [SourceCode], [IsVerified]);
 

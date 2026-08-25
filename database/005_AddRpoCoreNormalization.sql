@@ -19,7 +19,7 @@ BEGIN TRY
 		);
 
 		CREATE UNIQUE INDEX [UX_SubjectName_Attribution]
-			ON [registry].[SubjectName] ([SubjectId], [SourceCode], [NameHash], [ValidFrom]);
+			ON [registry].[SubjectName] ([SubjectId], [SourceCode], [NameHash], [ValidFrom], [ValidTo]);
 
 		CREATE INDEX [IX_SubjectName_Current]
 			ON [registry].[SubjectName] ([SubjectId], [ValidTo], [ValidFrom])
@@ -48,6 +48,71 @@ BEGIN TRY
 	BEGIN
 		ALTER TABLE [registry].[SubjectName]
 		DROP CONSTRAINT [CK_SubjectName_Validity];
+	END;
+
+	IF NOT EXISTS
+	(
+		SELECT 1
+		FROM [sys].[indexes] AS [index]
+		INNER JOIN [sys].[index_columns] AS [indexColumn]
+			ON [indexColumn].[object_id] = [index].[object_id]
+		   AND [indexColumn].[index_id] = [index].[index_id]
+		INNER JOIN [sys].[columns] AS [column]
+			ON [column].[object_id] = [indexColumn].[object_id]
+		   AND [column].[column_id] = [indexColumn].[column_id]
+		WHERE [index].[object_id] = OBJECT_ID(N'[registry].[SubjectIdentifier]')
+		  AND [index].[name] = N'UQ_SubjectIdentifier_Attribution'
+		  AND [column].[name] = N'ValidTo'
+		  AND [indexColumn].[is_included_column] = 0
+	)
+	BEGIN
+		IF EXISTS
+		(
+			SELECT 1
+			FROM [sys].[key_constraints]
+			WHERE [parent_object_id] = OBJECT_ID(N'[registry].[SubjectIdentifier]')
+			  AND [name] = N'UQ_SubjectIdentifier_Attribution'
+		)
+		BEGIN
+			ALTER TABLE [registry].[SubjectIdentifier]
+			DROP CONSTRAINT [UQ_SubjectIdentifier_Attribution];
+		END;
+
+		ALTER TABLE [registry].[SubjectIdentifier]
+		ADD CONSTRAINT [UQ_SubjectIdentifier_Attribution]
+			UNIQUE ([SubjectId], [IdentifierTypeCode], [IdentifierValue], [SourceCode], [ValidFrom], [ValidTo]);
+	END;
+
+	IF NOT EXISTS
+	(
+		SELECT 1
+		FROM [sys].[indexes] AS [index]
+		INNER JOIN [sys].[index_columns] AS [indexColumn]
+			ON [indexColumn].[object_id] = [index].[object_id]
+		   AND [indexColumn].[index_id] = [index].[index_id]
+		INNER JOIN [sys].[columns] AS [column]
+			ON [column].[object_id] = [indexColumn].[object_id]
+		   AND [column].[column_id] = [indexColumn].[column_id]
+		WHERE [index].[object_id] = OBJECT_ID(N'[registry].[SubjectName]')
+		  AND [index].[name] = N'UX_SubjectName_Attribution'
+		  AND [column].[name] = N'ValidTo'
+		  AND [indexColumn].[is_included_column] = 0
+	)
+	BEGIN
+		IF EXISTS
+		(
+			SELECT 1
+			FROM [sys].[indexes]
+			WHERE [object_id] = OBJECT_ID(N'[registry].[SubjectName]')
+			  AND [name] = N'UX_SubjectName_Attribution'
+		)
+		BEGIN
+			DROP INDEX [UX_SubjectName_Attribution]
+				ON [registry].[SubjectName];
+		END;
+
+		CREATE UNIQUE INDEX [UX_SubjectName_Attribution]
+			ON [registry].[SubjectName] ([SubjectId], [SourceCode], [NameHash], [ValidFrom], [ValidTo]);
 	END;
 
 	COMMIT TRANSACTION;
@@ -291,6 +356,48 @@ BEGIN
 		  AND [identifier].[ValidTo] IS NOT NULL
 		  AND [identifier].[ValidTo] < [identifier].[ValidFrom];
 
+		INSERT INTO [registry].[DataQualityObservation]
+			([SourceCode], [SourceEntityId], [SubjectId], [RuleCode], [Severity], [Details])
+		SELECT
+			'RPO',
+			[pending].[SourceEntityId],
+			[mapped].[SubjectId],
+			'RPO_IDENTIFIER_CONFLICTING_VALID_TO',
+			'Warning',
+			CONVERT
+			(
+				nvarchar(4000),
+				CONCAT
+				(
+					N'IČO ',
+					[identifier].[IdentifierValue],
+					N' has multiple ValidTo values for ValidFrom ',
+					COALESCE(CONVERT(nvarchar(10), [identifier].[ValidFrom], 23), N'<NULL>'),
+					N'. All distinct source intervals were preserved.'
+				)
+			)
+		FROM [#Pending] AS [pending]
+		INNER JOIN [#SubjectMap] AS [mapped]
+			ON [mapped].[RawRecordId] = [pending].[RawRecordId]
+		CROSS APPLY OPENJSON([pending].[JsonData], '$.identifiers') AS [jsonIdentifier]
+		CROSS APPLY
+		(
+			SELECT
+				CONVERT(nvarchar(100), JSON_VALUE([jsonIdentifier].[value], '$.value')) COLLATE DATABASE_DEFAULT AS [IdentifierValue],
+				TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validFrom')) AS [ValidFrom],
+				TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validTo')) AS [ValidTo]
+		) AS [identifier]
+		WHERE NULLIF([identifier].[IdentifierValue], '') IS NOT NULL
+		GROUP BY
+			[pending].[SourceEntityId],
+			[mapped].[SubjectId],
+			[identifier].[IdentifierValue],
+			[identifier].[ValidFrom]
+		HAVING COUNT
+		(
+			DISTINCT COALESCE(CONVERT(varchar(10), [identifier].[ValidTo], 23), '<NULL>')
+		) > 1;
+
 		INSERT INTO [registry].[SubjectIdentifier]
 			([SubjectId], [IdentifierTypeCode], [IdentifierValue], [SourceCode], [ValidFrom], [ValidTo], [IsVerified])
 		SELECT DISTINCT
@@ -325,6 +432,11 @@ BEGIN
 			  (
 				[existing].[ValidFrom] = [identifier].[ValidFrom]
 				OR ([existing].[ValidFrom] IS NULL AND [identifier].[ValidFrom] IS NULL)
+			  )
+			  AND
+			  (
+				[existing].[ValidTo] = [identifier].[ValidTo]
+				OR ([existing].[ValidTo] IS NULL AND [identifier].[ValidTo] IS NULL)
 			  )
 		);
 
@@ -367,6 +479,48 @@ BEGIN
 		  AND [name].[ValidTo] IS NOT NULL
 		  AND [name].[ValidTo] < [name].[ValidFrom];
 
+		INSERT INTO [registry].[DataQualityObservation]
+			([SourceCode], [SourceEntityId], [SubjectId], [RuleCode], [Severity], [Details])
+		SELECT
+			'RPO',
+			[pending].[SourceEntityId],
+			[mapped].[SubjectId],
+			'RPO_NAME_CONFLICTING_VALID_TO',
+			'Warning',
+			CONVERT
+			(
+				nvarchar(4000),
+				CONCAT
+				(
+					N'Name "',
+					[name].[NameValue],
+					N'" has multiple ValidTo values for ValidFrom ',
+					COALESCE(CONVERT(nvarchar(10), [name].[ValidFrom], 23), N'<NULL>'),
+					N'. All distinct source intervals were preserved.'
+				)
+			)
+		FROM [#Pending] AS [pending]
+		INNER JOIN [#SubjectMap] AS [mapped]
+			ON [mapped].[RawRecordId] = [pending].[RawRecordId]
+		CROSS APPLY OPENJSON([pending].[JsonData], '$.fullNames') AS [jsonName]
+		CROSS APPLY
+		(
+			SELECT
+				CONVERT(nvarchar(1000), JSON_VALUE([jsonName].[value], '$.value')) COLLATE DATABASE_DEFAULT AS [NameValue],
+				TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validFrom')) AS [ValidFrom],
+				TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validTo')) AS [ValidTo]
+		) AS [name]
+		WHERE NULLIF([name].[NameValue], '') IS NOT NULL
+		GROUP BY
+			[pending].[SourceEntityId],
+			[mapped].[SubjectId],
+			[name].[NameValue],
+			[name].[ValidFrom]
+		HAVING COUNT
+		(
+			DISTINCT COALESCE(CONVERT(varchar(10), [name].[ValidTo], 23), '<NULL>')
+		) > 1;
+
 		INSERT INTO [registry].[SubjectName]
 			([SubjectId], [NameValue], [SourceCode], [ValidFrom], [ValidTo])
 		SELECT DISTINCT
@@ -398,6 +552,11 @@ BEGIN
 			  (
 				[existing].[ValidFrom] = [name].[ValidFrom]
 				OR ([existing].[ValidFrom] IS NULL AND [name].[ValidFrom] IS NULL)
+			  )
+			  AND
+			  (
+				[existing].[ValidTo] = [name].[ValidTo]
+				OR ([existing].[ValidTo] IS NULL AND [name].[ValidTo] IS NULL)
 			  )
 		);
 
