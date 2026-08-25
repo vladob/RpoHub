@@ -1,0 +1,186 @@
+From 386edc628312bedb25494193792deec147323e2a Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 25 Aug 2026 11:08:43 -0500
+Subject: [PATCH] Add RPO initialization package preview
+
+---
+ README.md                                     |  3 +-
+ src/RpoHub.Application/Contracts.cs           | 72 +++++++++++++++++++
+ src/RpoHub.Infrastructure/RpoClients.cs       | 13 ++--
+ .../ServiceCollectionExtensions.cs            |  1 +
+ src/RpoHub.Web/Program.cs                     |  3 +-
+ 5 files changed, 86 insertions(+), 6 deletions(-)
+
+diff --git a/README.md b/README.md
+index 5aa7218..ca8795a 100644
+--- a/README.md
++++ b/README.md
+@@ -13,6 +13,8 @@ Foundation for importing, normalizing, verifying, and monitoring Slovak public-r
+ 
+ Raw source JSON is retained unchanged in `raw.SourceRecord`. Normalization is a separate, repeatable step. An IČO, DIČ, or IČ DPH is an attributed identifier, not the database primary key. Conflicting identifiers are recorded as data-quality observations and do not silently merge subjects.
+ 
++The initialization export is treated as a package: a dated manifest plus all consecutively numbered `.json.gz` parts. `GET /api/import/initialization` previews and validates available packages without downloading or changing database state.
++
+ ## First run
+ 
+ 1. Install the .NET 8 SDK and SQL Server.
+@@ -41,4 +43,3 @@ The worker never assumes that missing ETL metadata means an empty database. Init
+ ## Next vertical slice
+ 
+ Implement streaming `.json.gz` download into `raw.SourceRecord`, using a bounded batch and `SqlBulkCopy`, then normalize names and identifiers. The old `PgDumpImporter` project remains useful as a reference for sequential streaming, progress, cancellation, and bulk-copy patterns—not for its PostgreSQL COPY parser.
+-
+diff --git a/src/RpoHub.Application/Contracts.cs b/src/RpoHub.Application/Contracts.cs
+index 4ffe83f..f36efe8 100644
+--- a/src/RpoHub.Application/Contracts.cs
++++ b/src/RpoHub.Application/Contracts.cs
+@@ -1,4 +1,6 @@
++using System.Globalization;
+ using System.Text.Json;
++using System.Text.RegularExpressions;
+ using RpoHub.Domain;
+ 
+ namespace RpoHub.Application;
+@@ -6,6 +8,14 @@ namespace RpoHub.Application;
+ public sealed record RemoteFile(string Key, Uri DownloadUri, long? Size, DateTimeOffset? ModifiedAtUtc, string? ETag);
+ public sealed record ImportReadiness(bool CanInitialize, bool HasRawData, bool HasEtlState, string Explanation);
+ public sealed record RpoSearchHit(long? Id, string? Identifier, string? FullName, JsonElement Raw);
++public sealed record InitializationPackage(
++    DateOnly SnapshotDate,
++    IReadOnlyList<RemoteFile> Parts,
++    RemoteFile? Manifest,
++    long TotalCompressedBytes,
++    bool HasContiguousParts,
++    bool IsStructurallyComplete);
++public sealed record InitializationPreview(ImportReadiness Readiness, IReadOnlyList<InitializationPackage> Packages);
+ 
+ public interface IRpoApiClient
+ {
+@@ -39,3 +49,65 @@ public sealed class DiscoverRpoUpdates(IRpoExportCatalog catalog, IImportStateSt
+         return files.Count;
+     }
+ }
++
++public sealed partial class GetRpoInitializationPreview(IRpoExportCatalog catalog, IImportStateStore stateStore)
++{
++    public async Task<InitializationPreview> ExecuteAsync(CancellationToken cancellationToken)
++    {
++        var readinessTask = stateStore.GetReadinessAsync(cancellationToken);
++        var filesTask = catalog.ListInitializationFilesAsync(cancellationToken);
++        await Task.WhenAll(readinessTask, filesTask);
++
++        var packages = filesTask.Result
++            .Select(ParseInitializationFile)
++            .Where(item => item is not null)
++            .Select(item => item!.Value)
++            .GroupBy(item => item.SnapshotDate)
++            .OrderByDescending(group => group.Key)
++            .Select(CreatePackage)
++            .ToArray();
++
++        return new InitializationPreview(readinessTask.Result, packages);
++    }
++
++    private static (DateOnly SnapshotDate, int? PartNumber, bool IsManifest, RemoteFile File)? ParseInitializationFile(RemoteFile file)
++    {
++        var partMatch = InitializationPartPattern().Match(file.Key);
++        if (partMatch.Success &&
++            DateOnly.TryParseExact(partMatch.Groups[1].Value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var partDate) &&
++            int.TryParse(partMatch.Groups[2].Value, out var partNumber))
++        {
++            return (partDate, partNumber, false, file);
++        }
++
++        var manifestMatch = InitializationManifestPattern().Match(file.Key);
++        if (manifestMatch.Success && DateOnly.TryParseExact(manifestMatch.Groups[1].Value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var manifestDate))
++            return (manifestDate, null, true, file);
++
++        return null;
++    }
++
++    private static InitializationPackage CreatePackage(
++        IGrouping<DateOnly, (DateOnly SnapshotDate, int? PartNumber, bool IsManifest, RemoteFile File)> group)
++    {
++        var parts = group
++            .Where(item => item.PartNumber.HasValue)
++            .OrderBy(item => item.PartNumber)
++            .ToArray();
++        RemoteFile? manifest = group.Where(item => item.IsManifest).Select(item => item.File).FirstOrDefault();
++        var contiguous = parts.Length > 0 && parts.Select((item, index) => item.PartNumber == index + 1).All(value => value);
++        return new InitializationPackage(
++            group.Key,
++            parts.Select(item => item.File).ToArray(),
++            manifest,
++            parts.Sum(item => item.File.Size ?? 0),
++            contiguous,
++            manifest is not null && contiguous);
++    }
++
++    [GeneratedRegex(@"^batch-init/init_(\d{4}-\d{2}-\d{2})_(\d{3})\.json\.gz$", RegexOptions.CultureInvariant)]
++    private static partial Regex InitializationPartPattern();
++
++    [GeneratedRegex(@"^batch-init/init_(\d{4}-\d{2}-\d{2})_list\.txt$", RegexOptions.CultureInvariant)]
++    private static partial Regex InitializationManifestPattern();
++}
+diff --git a/src/RpoHub.Infrastructure/RpoClients.cs b/src/RpoHub.Infrastructure/RpoClients.cs
+index 2c4d910..97de141 100644
+--- a/src/RpoHub.Infrastructure/RpoClients.cs
++++ b/src/RpoHub.Infrastructure/RpoClients.cs
+@@ -54,10 +54,15 @@ public sealed class RpoApiClient(HttpClient httpClient) : IRpoApiClient
+ 
+ public sealed class RpoExportCatalog(HttpClient httpClient, IOptions<RpoOptions> options) : IRpoExportCatalog
+ {
+-    public Task<IReadOnlyList<RemoteFile>> ListInitializationFilesAsync(CancellationToken cancellationToken) => ListAsync(options.Value.InitializationPrefix, cancellationToken);
+-    public Task<IReadOnlyList<RemoteFile>> ListDailyFilesAsync(CancellationToken cancellationToken) => ListAsync(options.Value.DailyPrefix, cancellationToken);
++    public Task<IReadOnlyList<RemoteFile>> ListInitializationFilesAsync(CancellationToken cancellationToken) =>
++        ListAsync(options.Value.InitializationPrefix, key =>
++            key.EndsWith(".json.gz", StringComparison.OrdinalIgnoreCase) ||
++            key.EndsWith("_list.txt", StringComparison.OrdinalIgnoreCase), cancellationToken);
+ 
+-    private async Task<IReadOnlyList<RemoteFile>> ListAsync(string prefix, CancellationToken cancellationToken)
++    public Task<IReadOnlyList<RemoteFile>> ListDailyFilesAsync(CancellationToken cancellationToken) =>
++        ListAsync(options.Value.DailyPrefix, key => key.EndsWith(".json.gz", StringComparison.OrdinalIgnoreCase), cancellationToken);
++
++    private async Task<IReadOnlyList<RemoteFile>> ListAsync(string prefix, Func<string, bool> include, CancellationToken cancellationToken)
+     {
+         var request = $"?list-type=2&prefix={Uri.EscapeDataString(prefix)}";
+         using var response = await httpClient.GetAsync(request, cancellationToken);
+@@ -70,6 +75,6 @@ public sealed class RpoExportCatalog(HttpClient httpClient, IOptions<RpoOptions>
+             long? size = long.TryParse((string?)node.Element(ns + "Size"), out var parsedSize) ? parsedSize : null;
+             DateTimeOffset? modified = DateTimeOffset.TryParse((string?)node.Element(ns + "LastModified"), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsedDate) ? parsedDate : null;
+             return new RemoteFile(key, new Uri(options.Value.ExportBaseUrl, key), size, modified, (string?)node.Element(ns + "ETag"));
+-        }).Where(file => file.Key.EndsWith(".json.gz", StringComparison.OrdinalIgnoreCase)).ToArray();
++        }).Where(file => include(file.Key)).ToArray();
+     }
+ }
+diff --git a/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs b/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
+index 0263e14..0c0bf82 100644
+--- a/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
++++ b/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
+@@ -19,6 +19,7 @@ public static class ServiceCollectionExtensions
+         services.AddSingleton<IImportStateStore>(_ => new SqlImportStateStore(connectionString));
+         services.AddSingleton<IRawRecordStore>(_ => new SqlRawRecordStore(connectionString));
+         services.AddTransient<DiscoverRpoUpdates>();
++        services.AddTransient<GetRpoInitializationPreview>();
+         return services;
+     }
+ }
+diff --git a/src/RpoHub.Web/Program.cs b/src/RpoHub.Web/Program.cs
+index a2c5f4b..e6ceb2b 100644
+--- a/src/RpoHub.Web/Program.cs
++++ b/src/RpoHub.Web/Program.cs
+@@ -9,10 +9,11 @@ app.MapGet("/", () => Results.Content("""
+ <!doctype html><html lang="sk"><meta charset="utf-8"><title>RpoHub</title>
+ <style>body{font:16px system-ui;max-width:880px;margin:4rem auto;padding:0 1rem;color:#172033}code{background:#eef2f7;padding:.15rem .35rem;border-radius:.25rem}</style>
+ <h1>RpoHub</h1><p>Foundation is running.</p>
+-<ul><li><code>GET /api/status</code> — initialization safety state</li><li><code>GET /api/rpo/search/{ico}</code> — live RPO verification</li><li><code>POST /api/import/discover</code> — discover official daily files</li></ul></html>
++<ul><li><code>GET /api/status</code> — initialization safety state</li><li><code>GET /api/import/initialization</code> — preview official initialization packages</li><li><code>GET /api/rpo/search/{ico}</code> — live RPO verification</li><li><code>POST /api/import/discover</code> — discover official daily files</li></ul></html>
+ """, "text/html; charset=utf-8"));
+ 
+ app.MapGet("/api/status", (IImportStateStore store, CancellationToken ct) => store.GetReadinessAsync(ct));
++app.MapGet("/api/import/initialization", (GetRpoInitializationPreview useCase, CancellationToken ct) => useCase.ExecuteAsync(ct));
+ app.MapGet("/api/rpo/search/{ico}", (string ico, IRpoApiClient client, CancellationToken ct) => client.SearchByIcoAsync(ico, ct));
+ app.MapPost("/api/import/discover", async (DiscoverRpoUpdates useCase, CancellationToken ct) => Results.Ok(new { discovered = await useCase.ExecuteAsync(ct) }));
+ app.Run();
+-- 
+2.51.1
+

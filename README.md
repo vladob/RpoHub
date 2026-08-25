@@ -13,6 +13,8 @@ Foundation for importing, normalizing, verifying, and monitoring Slovak public-r
 
 Raw source JSON is retained unchanged in `raw.SourceRecord`. Normalization is a separate, repeatable step. An IČO, DIČ, or IČ DPH is an attributed identifier, not the database primary key. Conflicting identifiers are recorded as data-quality observations and do not silently merge subjects.
 
+The initialization export is treated as a package: a dated manifest plus all consecutively numbered `.json.gz` parts. `GET /api/import/initialization` previews and validates available packages without downloading or changing database state.
+
 ## First run
 
 1. Install the .NET 8 SDK and SQL Server.
@@ -41,4 +43,3 @@ The worker never assumes that missing ETL metadata means an empty database. Init
 ## Next vertical slice
 
 Implement streaming `.json.gz` download into `raw.SourceRecord`, using a bounded batch and `SqlBulkCopy`, then normalize names and identifiers. The old `PgDumpImporter` project remains useful as a reference for sequential streaming, progress, cancellation, and bulk-copy patterns—not for its PostgreSQL COPY parser.
-

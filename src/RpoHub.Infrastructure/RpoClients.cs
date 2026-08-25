@@ -54,10 +54,15 @@ public sealed class RpoApiClient(HttpClient httpClient) : IRpoApiClient
 
 public sealed class RpoExportCatalog(HttpClient httpClient, IOptions<RpoOptions> options) : IRpoExportCatalog
 {
-    public Task<IReadOnlyList<RemoteFile>> ListInitializationFilesAsync(CancellationToken cancellationToken) => ListAsync(options.Value.InitializationPrefix, cancellationToken);
-    public Task<IReadOnlyList<RemoteFile>> ListDailyFilesAsync(CancellationToken cancellationToken) => ListAsync(options.Value.DailyPrefix, cancellationToken);
+    public Task<IReadOnlyList<RemoteFile>> ListInitializationFilesAsync(CancellationToken cancellationToken) =>
+        ListAsync(options.Value.InitializationPrefix, key =>
+            key.EndsWith(".json.gz", StringComparison.OrdinalIgnoreCase) ||
+            key.EndsWith("_list.txt", StringComparison.OrdinalIgnoreCase), cancellationToken);
 
-    private async Task<IReadOnlyList<RemoteFile>> ListAsync(string prefix, CancellationToken cancellationToken)
+    public Task<IReadOnlyList<RemoteFile>> ListDailyFilesAsync(CancellationToken cancellationToken) =>
+        ListAsync(options.Value.DailyPrefix, key => key.EndsWith(".json.gz", StringComparison.OrdinalIgnoreCase), cancellationToken);
+
+    private async Task<IReadOnlyList<RemoteFile>> ListAsync(string prefix, Func<string, bool> include, CancellationToken cancellationToken)
     {
         var request = $"?list-type=2&prefix={Uri.EscapeDataString(prefix)}";
         using var response = await httpClient.GetAsync(request, cancellationToken);
@@ -70,6 +75,6 @@ public sealed class RpoExportCatalog(HttpClient httpClient, IOptions<RpoOptions>
             long? size = long.TryParse((string?)node.Element(ns + "Size"), out var parsedSize) ? parsedSize : null;
             DateTimeOffset? modified = DateTimeOffset.TryParse((string?)node.Element(ns + "LastModified"), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsedDate) ? parsedDate : null;
             return new RemoteFile(key, new Uri(options.Value.ExportBaseUrl, key), size, modified, (string?)node.Element(ns + "ETag"));
-        }).Where(file => file.Key.EndsWith(".json.gz", StringComparison.OrdinalIgnoreCase)).ToArray();
+        }).Where(file => include(file.Key)).ToArray();
     }
 }
