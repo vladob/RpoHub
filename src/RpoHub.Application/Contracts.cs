@@ -22,6 +22,13 @@ public sealed record InitializationStartResult(
     int DataFileCount,
     long TotalCompressedBytes,
     string Status);
+public sealed record InitializationFileImportResult(
+    Guid? FileId,
+    string? RemoteKey,
+    long RowsRead,
+    long RowsInserted,
+    string Status,
+    bool BatchCompleted);
 
 public interface IRpoApiClient
 {
@@ -46,6 +53,12 @@ public interface IImportStateStore
 public interface IRawRecordStore
 {
     Task StageAsync(SourceRecordKey key, string json, DateTimeOffset? sourceModifiedAtUtc, Guid importFileId, CancellationToken cancellationToken);
+}
+
+public interface IInitializationFileImporter
+{
+    Task<InitializationFileImportResult> ImportNextAsync(Guid batchId, CancellationToken cancellationToken);
+    Task<InitializationFileImportResult?> ImportNextStartedBatchAsync(CancellationToken cancellationToken);
 }
 
 public sealed class DiscoverRpoUpdates(IRpoExportCatalog catalog, IImportStateStore stateStore)

@@ -13,6 +13,7 @@ public static class ServiceCollectionExtensions
             client.BaseAddress = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<RpoOptions>>().Value.ApiBaseUrl);
         services.AddHttpClient<IRpoExportCatalog, RpoExportCatalog>((provider, client) =>
             client.BaseAddress = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<RpoOptions>>().Value.ExportBaseUrl);
+        services.AddHttpClient("RpoPayload", client => client.Timeout = Timeout.InfiniteTimeSpan);
 
         var connectionString = configuration.GetConnectionString("Registers")
             ?? throw new InvalidOperationException("ConnectionStrings:Registers is required.");
@@ -21,6 +22,11 @@ public static class ServiceCollectionExtensions
         services.AddTransient<DiscoverRpoUpdates>();
         services.AddTransient<GetRpoInitializationPreview>();
         services.AddTransient<StartRpoInitialization>();
+        services.AddTransient<IInitializationFileImporter>(provider =>
+            new RpoInitializationFileImporter(
+                provider.GetRequiredService<IHttpClientFactory>().CreateClient("RpoPayload"),
+                connectionString,
+                provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RpoInitializationFileImporter>>()));
         return services;
     }
 }

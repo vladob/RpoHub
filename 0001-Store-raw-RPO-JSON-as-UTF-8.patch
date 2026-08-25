@@ -1,0 +1,126 @@
+From c56ee2f6786519d31f0d0647560d23e8fe850e6c Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 25 Aug 2026 12:14:03 -0500
+Subject: [PATCH] Store raw RPO JSON as UTF-8
+
+---
+ README.md                                     |  2 +
+ database/001_CreateFoundation.sql             |  2 +-
+ database/004_ConvertRawJsonToUtf8.sql         | 65 +++++++++++++++++++
+ .../RpoInitializationFileImporter.cs          |  2 +-
+ 4 files changed, 69 insertions(+), 2 deletions(-)
+ create mode 100644 database/004_ConvertRawJsonToUtf8.sql
+
+diff --git a/README.md b/README.md
+index f871b2f..938f7d8 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,8 @@ After running `database/002_AddInitializationPlanning.sql` on an existing databa
+ 
+ After running `database/003_AddImportFileExecutionState.sql`, `POST /api/import/initialization/{batchId}/import-next` claims the smallest pending JSON part, streams its `results` array through GZip, and writes idempotent 2,000-row batches into raw staging.
+ 
++`database/004_ConvertRawJsonToUtf8.sql` converts raw JSON from UTF-16 `nvarchar(max)` to UTF-8 `varchar(max)`, validates every JSON value, and confirms that stored SHA-256 content hashes remain unchanged.
++
+ ## First run
+ 
+ 1. Install the .NET 8 SDK and SQL Server.
+diff --git a/database/001_CreateFoundation.sql b/database/001_CreateFoundation.sql
+index 48c6db0..aa025c7 100644
+--- a/database/001_CreateFoundation.sql
++++ b/database/001_CreateFoundation.sql
+@@ -62,7 +62,7 @@ CREATE TABLE [raw].[SourceRecord]
+ 	[Id]						bigint IDENTITY(1,1)	NOT NULL CONSTRAINT [PK_RawSourceRecord] PRIMARY KEY,
+ 	[SourceCode]				varchar(30)				NOT NULL,
+ 	[SourceEntityId]			varchar(100)			NOT NULL,
+-	[JsonData]					nvarchar(max)			NOT NULL,
++	[JsonData]					varchar(max) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
+ 	[ContentHash]				binary(32)				NOT NULL,
+ 	[SourceModifiedAtUtc]		datetime2(3)			NULL,
+ 	[ImportFileId]				uniqueidentifier		NOT NULL CONSTRAINT [FK_RawSourceRecord_File] REFERENCES [etl].[ImportFile] ([Id]),
+diff --git a/database/004_ConvertRawJsonToUtf8.sql b/database/004_ConvertRawJsonToUtf8.sql
+new file mode 100644
+index 0000000..e22fcb4
+--- /dev/null
++++ b/database/004_ConvertRawJsonToUtf8.sql
+@@ -0,0 +1,65 @@
++SET XACT_ABORT ON;
++
++BEGIN TRY
++	BEGIN TRANSACTION;
++
++	IF EXISTS
++	(
++		SELECT 1
++		FROM [sys].[columns] AS [column]
++		INNER JOIN [sys].[types] AS [type]
++			ON [type].[user_type_id] = [column].[user_type_id]
++		WHERE [column].[object_id] = OBJECT_ID(N'raw.SourceRecord')
++		  AND [column].[name] = N'JsonData'
++		  AND
++		  (
++			[type].[name] <> N'varchar'
++			OR COLLATIONPROPERTY([column].[collation_name], N'CodePage') <> 65001
++		  )
++	)
++	BEGIN
++		IF EXISTS
++		(
++			SELECT 1
++			FROM [sys].[check_constraints]
++			WHERE [parent_object_id] = OBJECT_ID(N'raw.SourceRecord')
++			  AND [name] = N'CK_RawSourceRecord_Json'
++		)
++		BEGIN
++			ALTER TABLE [raw].[SourceRecord]
++			DROP CONSTRAINT [CK_RawSourceRecord_Json];
++		END;
++
++		EXEC
++		(
++			N'ALTER TABLE [raw].[SourceRecord]
++			  ALTER COLUMN [JsonData]
++			  varchar(max) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL;'
++		);
++
++		ALTER TABLE [raw].[SourceRecord] WITH CHECK
++		ADD CONSTRAINT [CK_RawSourceRecord_Json]
++			CHECK (ISJSON([JsonData]) = 1);
++
++		ALTER TABLE [raw].[SourceRecord]
++		CHECK CONSTRAINT [CK_RawSourceRecord_Json];
++	END;
++
++	IF EXISTS
++	(
++		SELECT 1
++		FROM [raw].[SourceRecord]
++		WHERE HASHBYTES('SHA2_256', CONVERT(varbinary(max), [JsonData])) <> [ContentHash]
++	)
++	BEGIN
++		THROW 51004, 'UTF-8 conversion changed one or more raw JSON content hashes.', 1;
++	END;
++
++	COMMIT TRANSACTION;
++END TRY
++BEGIN CATCH
++	IF @@TRANCOUNT > 0
++		ROLLBACK TRANSACTION;
++
++	THROW;
++END CATCH;
+diff --git a/src/RpoHub.Infrastructure/RpoInitializationFileImporter.cs b/src/RpoHub.Infrastructure/RpoInitializationFileImporter.cs
+index 5f7f8fa..03c356b 100644
+--- a/src/RpoHub.Infrastructure/RpoInitializationFileImporter.cs
++++ b/src/RpoHub.Infrastructure/RpoInitializationFileImporter.cs
+@@ -199,7 +199,7 @@ public sealed class RpoInitializationFileImporter(
+             CREATE TABLE [#RawSourceRecordBatch]
+             (
+                 [SourceEntityId] varchar(100) NOT NULL,
+-                [JsonData] nvarchar(max) NOT NULL,
++                [JsonData] varchar(max) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
+                 [ContentHash] binary(32) NOT NULL
+             );
+             """;
+-- 
+2.51.1
+

@@ -1,0 +1,229 @@
+From 3250ce3ce1c04f9c0b0343bb1fca15bbaebd70f7 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 25 Aug 2026 12:22:42 -0500
+Subject: [PATCH v2] Automate initialization import in worker
+
+---
+ README.md                                     |  2 +
+ src/RpoHub.Application/Contracts.cs           |  1 +
+ .../RpoInitializationFileImporter.cs          | 50 ++++++++++++++++++-
+ src/RpoHub.Infrastructure/RpoOptions.cs       |  1 +
+ src/RpoHub.Web/appsettings.json               |  3 +-
+ .../InitializationImportWorker.cs             | 43 ++++++++++++++++
+ src/RpoHub.Worker/Program.cs                  |  1 +
+ src/RpoHub.Worker/appsettings.json            |  3 +-
+ 8 files changed, 100 insertions(+), 4 deletions(-)
+ create mode 100644 src/RpoHub.Worker/InitializationImportWorker.cs
+
+diff --git a/README.md b/README.md
+index 938f7d8..416d905 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,8 @@ After running `database/003_AddImportFileExecutionState.sql`, `POST /api/import/
+ 
+ `database/004_ConvertRawJsonToUtf8.sql` converts raw JSON from UTF-16 `nvarchar(max)` to UTF-8 `varchar(max)`, validates every JSON value, and confirms that stored SHA-256 content hashes remain unchanged.
+ 
++The Worker automatically resumes a `Started` initialization batch, importing one file at a time. A database application lock plus the persisted `Importing` status prevents concurrent Web and Worker claims.
++
+ ## First run
+ 
+ 1. Install the .NET 8 SDK and SQL Server.
+diff --git a/src/RpoHub.Application/Contracts.cs b/src/RpoHub.Application/Contracts.cs
+index 4de61cb..6688636 100644
+--- a/src/RpoHub.Application/Contracts.cs
++++ b/src/RpoHub.Application/Contracts.cs
+@@ -58,6 +58,7 @@ public interface IRawRecordStore
+ public interface IInitializationFileImporter
+ {
+     Task<InitializationFileImportResult> ImportNextAsync(Guid batchId, CancellationToken cancellationToken);
++    Task<InitializationFileImportResult?> ImportNextStartedBatchAsync(CancellationToken cancellationToken);
+ }
+ 
+ public sealed class DiscoverRpoUpdates(IRpoExportCatalog catalog, IImportStateStore stateStore)
+diff --git a/src/RpoHub.Infrastructure/RpoInitializationFileImporter.cs b/src/RpoHub.Infrastructure/RpoInitializationFileImporter.cs
+index 03c356b..e51fa3b 100644
+--- a/src/RpoHub.Infrastructure/RpoInitializationFileImporter.cs
++++ b/src/RpoHub.Infrastructure/RpoInitializationFileImporter.cs
+@@ -19,6 +19,23 @@ public sealed class RpoInitializationFileImporter(
+ {
+     private const int RawBatchSize = 2_000;
+ 
++    public async Task<InitializationFileImportResult?> ImportNextStartedBatchAsync(CancellationToken cancellationToken)
++    {
++        const string sql = """
++            SELECT TOP (1) [Id]
++            FROM [etl].[ImportBatch]
++            WHERE [SourceCode] = 'RPO'
++              AND [BatchKind] = 'Initialization'
++              AND [Status] = 'Started'
++            ORDER BY [StartedAtUtc], [Id];
++            """;
++        await using var connection = new SqlConnection(connectionString);
++        await connection.OpenAsync(cancellationToken);
++        await using var command = new SqlCommand(sql, connection);
++        var value = await command.ExecuteScalarAsync(cancellationToken);
++        return value is Guid batchId ? await ImportNextAsync(batchId, cancellationToken) : null;
++    }
++
+     public async Task<InitializationFileImportResult> ImportNextAsync(Guid batchId, CancellationToken cancellationToken)
+     {
+         var file = await ClaimNextFileAsync(batchId, cancellationToken);
+@@ -98,6 +115,15 @@ public sealed class RpoInitializationFileImporter(
+ 
+     private async Task<ImportFileWorkItem?> ClaimNextFileAsync(Guid batchId, CancellationToken cancellationToken)
+     {
++        const string acquireLockSql = """
++            DECLARE @LockResult int;
++            EXEC @LockResult = [sys].[sp_getapplock]
++                @Resource = N'RpoHub:RPO:InitializationFileClaim',
++                @LockMode = N'Exclusive',
++                @LockOwner = N'Transaction',
++                @LockTimeout = 0;
++            SELECT @LockResult;
++            """;
+         const string selectSql = """
+             SELECT TOP (1)
+                 [file].[Id], [file].[RemoteKey], [file].[RemoteUri], [file].[SizeBytes], [file].[ETag], [batch].[SnapshotDate]
+@@ -106,8 +132,16 @@ public sealed class RpoInitializationFileImporter(
+             WHERE [file].[ImportBatchId] = @BatchId
+               AND [batch].[Status] = 'Started'
+               AND [file].[BatchKind] = 'Initialization'
+-              AND [file].[Status] = 'Discovered'
++              AND [file].[Status] IN ('Discovered', 'Failed')
++              AND [file].[AttemptCount] < 3
+               AND [file].[RemoteKey] LIKE '%.json.gz'
++              AND NOT EXISTS
++              (
++                  SELECT 1
++                  FROM [etl].[ImportFile] AS [running] WITH (UPDLOCK, HOLDLOCK)
++                  WHERE [running].[ImportBatchId] = @BatchId
++                    AND [running].[Status] = 'Importing'
++              )
+             ORDER BY [file].[SizeBytes], [file].[RemoteKey];
+             """;
+         const string claimSql = """
+@@ -116,12 +150,24 @@ public sealed class RpoInitializationFileImporter(
+                 [AttemptCount] = [AttemptCount] + 1,
+                 [LastAttemptAtUtc] = SYSUTCDATETIME(),
+                 [ErrorMessage] = NULL
+-            WHERE [Id] = @FileId AND [Status] = 'Discovered';
++            WHERE [Id] = @FileId
++              AND [Status] IN ('Discovered', 'Failed')
++              AND [AttemptCount] < 3;
+             """;
+ 
+         await using var connection = new SqlConnection(connectionString);
+         await connection.OpenAsync(cancellationToken);
+         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
++        await using (var lockCommand = new SqlCommand(acquireLockSql, connection, transaction))
++        {
++            var lockResult = Convert.ToInt32(await lockCommand.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
++            if (lockResult < 0)
++            {
++                await transaction.RollbackAsync(cancellationToken);
++                return null;
++            }
++        }
++
+         await using var selectCommand = new SqlCommand(selectSql, connection, transaction);
+         selectCommand.Parameters.AddWithValue("@BatchId", batchId);
+         ImportFileWorkItem? item = null;
+diff --git a/src/RpoHub.Infrastructure/RpoOptions.cs b/src/RpoHub.Infrastructure/RpoOptions.cs
+index 1257d36..87f335f 100644
+--- a/src/RpoHub.Infrastructure/RpoOptions.cs
++++ b/src/RpoHub.Infrastructure/RpoOptions.cs
+@@ -8,4 +8,5 @@ public sealed class RpoOptions
+     public string InitializationPrefix { get; set; } = "batch-init/";
+     public string DailyPrefix { get; set; } = "batch-daily/";
+     public TimeSpan DiscoveryInterval { get; set; } = TimeSpan.FromHours(24);
++    public TimeSpan InitializationPollInterval { get; set; } = TimeSpan.FromSeconds(30);
+ }
+diff --git a/src/RpoHub.Web/appsettings.json b/src/RpoHub.Web/appsettings.json
+index 8ce3665..4ecd880 100644
+--- a/src/RpoHub.Web/appsettings.json
++++ b/src/RpoHub.Web/appsettings.json
+@@ -5,7 +5,8 @@
+     "ExportBaseUrl": "https://frkqbrydxwdp.compat.objectstorage.eu-frankfurt-1.oraclecloud.com/susr-rpo/",
+     "InitializationPrefix": "batch-init/",
+     "DailyPrefix": "batch-daily/",
+-    "DiscoveryInterval": "1.00:00:00"
++    "DiscoveryInterval": "1.00:00:00",
++    "InitializationPollInterval": "00:00:30"
+   },
+   "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } }
+ }
+diff --git a/src/RpoHub.Worker/InitializationImportWorker.cs b/src/RpoHub.Worker/InitializationImportWorker.cs
+new file mode 100644
+index 0000000..7fd9bc3
+--- /dev/null
++++ b/src/RpoHub.Worker/InitializationImportWorker.cs
+@@ -0,0 +1,43 @@
++using Microsoft.Extensions.Options;
++using RpoHub.Application;
++using RpoHub.Infrastructure;
++
++namespace RpoHub.Worker;
++
++public sealed class InitializationImportWorker(
++    IInitializationFileImporter importer,
++    IOptions<RpoOptions> options,
++    ILogger<InitializationImportWorker> logger) : BackgroundService
++{
++    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
++    {
++        while (!stoppingToken.IsCancellationRequested)
++        {
++            try
++            {
++                var result = await importer.ImportNextStartedBatchAsync(stoppingToken);
++                if (result is null || result.Status == "NoPendingFiles")
++                {
++                    await Task.Delay(options.Value.InitializationPollInterval, stoppingToken);
++                    continue;
++                }
++
++                logger.LogInformation(
++                    "Initialization file {RemoteKey} completed: {RowsRead} read, {RowsInserted} inserted, batch completed: {BatchCompleted}.",
++                    result.RemoteKey,
++                    result.RowsRead,
++                    result.RowsInserted,
++                    result.BatchCompleted);
++            }
++            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
++            {
++                break;
++            }
++            catch (Exception exception)
++            {
++                logger.LogError(exception, "Initialization import iteration failed; processing will resume after the polling interval.");
++                await Task.Delay(options.Value.InitializationPollInterval, stoppingToken);
++            }
++        }
++    }
++}
+diff --git a/src/RpoHub.Worker/Program.cs b/src/RpoHub.Worker/Program.cs
+index 10f7b3b..e360b13 100644
+--- a/src/RpoHub.Worker/Program.cs
++++ b/src/RpoHub.Worker/Program.cs
+@@ -4,4 +4,5 @@ using RpoHub.Worker;
+ var builder = Host.CreateApplicationBuilder(args);
+ builder.Services.AddRpoHubInfrastructure(builder.Configuration);
+ builder.Services.AddHostedService<UpdateDiscoveryWorker>();
++builder.Services.AddHostedService<InitializationImportWorker>();
+ await builder.Build().RunAsync();
+diff --git a/src/RpoHub.Worker/appsettings.json b/src/RpoHub.Worker/appsettings.json
+index 84cc935..5d1ee4d 100644
+--- a/src/RpoHub.Worker/appsettings.json
++++ b/src/RpoHub.Worker/appsettings.json
+@@ -5,6 +5,7 @@
+     "ExportBaseUrl": "https://frkqbrydxwdp.compat.objectstorage.eu-frankfurt-1.oraclecloud.com/susr-rpo/",
+     "InitializationPrefix": "batch-init/",
+     "DailyPrefix": "batch-daily/",
+-    "DiscoveryInterval": "1.00:00:00"
++    "DiscoveryInterval": "1.00:00:00",
++    "InitializationPollInterval": "00:00:30"
+   }
+ }
+-- 
+2.51.1
+

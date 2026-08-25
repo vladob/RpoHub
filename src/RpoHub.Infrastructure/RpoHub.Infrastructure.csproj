@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\RpoHub.Application\RpoHub.Application.csproj" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.2" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 </Project>

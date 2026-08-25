@@ -17,6 +17,12 @@ The initialization export is treated as a package: a dated manifest plus all con
 
 After running `database/002_AddInitializationPlanning.sql` on an existing database, `POST /api/import/initialization/{snapshotDate}/start` validates the manifest and atomically records the initialization batch and its files. It does not download the large JSON parts.
 
+After running `database/003_AddImportFileExecutionState.sql`, `POST /api/import/initialization/{batchId}/import-next` claims the smallest pending JSON part, streams its `results` array through GZip, and writes idempotent 2,000-row batches into raw staging.
+
+`database/004_ConvertRawJsonToUtf8.sql` converts raw JSON from UTF-16 `nvarchar(max)` to UTF-8 `varchar(max)`, validates every JSON value, and confirms that stored SHA-256 content hashes remain unchanged.
+
+The Worker automatically resumes a `Started` initialization batch, importing one file at a time. A database application lock plus the persisted `Importing` status prevents concurrent Web and Worker claims.
+
 ## First run
 
 1. Install the .NET 8 SDK and SQL Server.

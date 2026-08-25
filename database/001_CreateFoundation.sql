@@ -48,6 +48,9 @@ CREATE TABLE [etl].[ImportFile]
 	[DiscoveredAtUtc]			datetime2(3)			NOT NULL CONSTRAINT [DF_ImportFile_Discovered] DEFAULT SYSUTCDATETIME(),
 	[ImportedAtUtc]				datetime2(3)			NULL,
 	[RowCount]					bigint					NULL,
+	[AttemptCount]				int						NOT NULL CONSTRAINT [DF_ImportFile_AttemptCount] DEFAULT 0,
+	[LastAttemptAtUtc]			datetime2(3)			NULL,
+	[ErrorMessage]				nvarchar(4000)			NULL,
 	[RemoteKeyHash] AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), [RemoteKey]))) PERSISTED,
 	CONSTRAINT [UQ_ImportFile_Source_KeyHash] UNIQUE ([SourceCode], [RemoteKeyHash]),
 	CONSTRAINT [CK_ImportFile_Status] CHECK ([Status] IN ('Discovered', 'Downloading', 'Downloaded', 'Importing', 'Imported', 'Failed', 'Skipped'))
@@ -59,7 +62,7 @@ CREATE TABLE [raw].[SourceRecord]
 	[Id]						bigint IDENTITY(1,1)	NOT NULL CONSTRAINT [PK_RawSourceRecord] PRIMARY KEY,
 	[SourceCode]				varchar(30)				NOT NULL,
 	[SourceEntityId]			varchar(100)			NOT NULL,
-	[JsonData]					nvarchar(max)			NOT NULL,
+	[JsonData]					varchar(max) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
 	[ContentHash]				binary(32)				NOT NULL,
 	[SourceModifiedAtUtc]		datetime2(3)			NULL,
 	[ImportFileId]				uniqueidentifier		NOT NULL CONSTRAINT [FK_RawSourceRecord_File] REFERENCES [etl].[ImportFile] ([Id]),
