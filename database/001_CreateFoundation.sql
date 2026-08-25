@@ -12,6 +12,7 @@ CREATE TABLE [etl].[ImportBatch]
 	[Id]						uniqueidentifier		NOT NULL CONSTRAINT [PK_ImportBatch] PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
 	[SourceCode]				varchar(30)				NOT NULL,
 	[BatchKind]					varchar(20)				NOT NULL,
+	[SnapshotDate]				date						NULL,
 	[Status]					varchar(20)				NOT NULL,
 	[StartedAtUtc]				datetime2(3)			NOT NULL CONSTRAINT [DF_ImportBatch_Started] DEFAULT SYSUTCDATETIME(),
 	[CompletedAtUtc]			datetime2(3)			NULL,
@@ -19,6 +20,17 @@ CREATE TABLE [etl].[ImportBatch]
 	CONSTRAINT [CK_ImportBatch_Kind] CHECK ([BatchKind] IN ('Initialization', 'Daily', 'Verification')),
 	CONSTRAINT [CK_ImportBatch_Status] CHECK ([Status] IN ('Started', 'Completed', 'Failed', 'Cancelled'))
 );
+
+IF NOT EXISTS
+(
+	SELECT 1
+	FROM [sys].[indexes]
+	WHERE [object_id] = OBJECT_ID(N'[etl].[ImportBatch]')
+	  AND [name] = N'UX_ImportBatch_Source_Snapshot'
+)
+CREATE UNIQUE INDEX [UX_ImportBatch_Source_Snapshot]
+	ON [etl].[ImportBatch] ([SourceCode], [BatchKind], [SnapshotDate])
+	WHERE [SnapshotDate] IS NOT NULL;
 
 IF OBJECT_ID(N'[etl].[ImportFile]', N'U') IS NULL
 CREATE TABLE [etl].[ImportFile]
@@ -36,7 +48,6 @@ CREATE TABLE [etl].[ImportFile]
 	[DiscoveredAtUtc]			datetime2(3)			NOT NULL CONSTRAINT [DF_ImportFile_Discovered] DEFAULT SYSUTCDATETIME(),
 	[ImportedAtUtc]				datetime2(3)			NULL,
 	[RowCount]					bigint					NULL,
---	CONSTRAINT [UQ_ImportFile_Source_Key] UNIQUE ([SourceCode], [RemoteKey]),
 	[RemoteKeyHash] AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), [RemoteKey]))) PERSISTED,
 	CONSTRAINT [UQ_ImportFile_Source_KeyHash] UNIQUE ([SourceCode], [RemoteKeyHash]),
 	CONSTRAINT [CK_ImportFile_Status] CHECK ([Status] IN ('Discovered', 'Downloading', 'Downloaded', 'Importing', 'Imported', 'Failed', 'Skipped'))

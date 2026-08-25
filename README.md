@@ -15,6 +15,8 @@ Raw source JSON is retained unchanged in `raw.SourceRecord`. Normalization is a 
 
 The initialization export is treated as a package: a dated manifest plus all consecutively numbered `.json.gz` parts. `GET /api/import/initialization` previews and validates available packages without downloading or changing database state.
 
+After running `database/002_AddInitializationPlanning.sql` on an existing database, `POST /api/import/initialization/{snapshotDate}/start` validates the manifest and atomically records the initialization batch and its files. It does not download the large JSON parts.
+
 ## First run
 
 1. Install the .NET 8 SDK and SQL Server.

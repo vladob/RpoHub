@@ -20,6 +20,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IRawRecordStore>(_ => new SqlRawRecordStore(connectionString));
         services.AddTransient<DiscoverRpoUpdates>();
         services.AddTransient<GetRpoInitializationPreview>();
+        services.AddTransient<StartRpoInitialization>();
         return services;
     }
 }

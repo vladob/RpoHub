@@ -47,6 +47,93 @@ public sealed class SqlImportStateStore(string connectionString) : IImportStateS
             await command.ExecuteNonQueryAsync(cancellationToken);
         }
     }
+
+    public async Task<Guid?> TryCreateInitializationBatchAsync(InitializationPackage package, CancellationToken cancellationToken)
+    {
+        const string createBatchSql = """
+            DECLARE @LockResult int;
+            EXEC @LockResult = sys.sp_getapplock
+                @Resource = N'RpoHub:RPO:Initialization',
+                @LockMode = N'Exclusive',
+                @LockOwner = N'Transaction',
+                @LockTimeout = 0;
+
+            IF @LockResult < 0
+            BEGIN
+                SELECT CAST(NULL AS uniqueidentifier);
+                RETURN;
+            END;
+
+            IF EXISTS (SELECT 1 FROM [raw].[SourceRecord] WITH (UPDLOCK, HOLDLOCK))
+               OR EXISTS (SELECT 1 FROM [etl].[ImportBatch] WITH (UPDLOCK, HOLDLOCK))
+            BEGIN
+                SELECT CAST(NULL AS uniqueidentifier);
+                RETURN;
+            END;
+
+            INSERT INTO [etl].[ImportBatch]
+                ([SourceCode], [BatchKind], [SnapshotDate], [Status])
+            OUTPUT INSERTED.[Id]
+            VALUES
+                ('RPO', 'Initialization', @SnapshotDate, 'Started');
+            """;
+
+        const string registerFileSql = """
+            MERGE [etl].[ImportFile] WITH (HOLDLOCK) AS [target]
+            USING (SELECT @SourceCode AS [SourceCode], @RemoteKey AS [RemoteKey]) AS [source]
+               ON [target].[SourceCode] = [source].[SourceCode]
+              AND [target].[RemoteKey] = [source].[RemoteKey]
+            WHEN MATCHED THEN
+                UPDATE SET
+                    [ImportBatchId] = @ImportBatchId,
+                    [RemoteUri] = @RemoteUri,
+                    [BatchKind] = 'Initialization',
+                    [Status] = @Status,
+                    [SizeBytes] = @SizeBytes,
+                    [ETag] = @ETag,
+                    [SourceModifiedAtUtc] = @ModifiedAt
+            WHEN NOT MATCHED THEN
+                INSERT ([ImportBatchId], [SourceCode], [RemoteKey], [RemoteUri], [BatchKind], [Status], [SizeBytes], [ETag], [SourceModifiedAtUtc])
+                VALUES (@ImportBatchId, @SourceCode, @RemoteKey, @RemoteUri, 'Initialization', @Status, @SizeBytes, @ETag, @ModifiedAt);
+            """;
+
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, cancellationToken);
+        try
+        {
+            await using var createCommand = new SqlCommand(createBatchSql, connection, transaction);
+            createCommand.Parameters.AddWithValue("@SnapshotDate", package.SnapshotDate.ToDateTime(TimeOnly.MinValue));
+            var scalar = await createCommand.ExecuteScalarAsync(cancellationToken);
+            if (scalar is not Guid batchId)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return null;
+            }
+
+            foreach (var file in package.Parts.Append(package.Manifest!))
+            {
+                await using var command = new SqlCommand(registerFileSql, connection, transaction);
+                command.Parameters.AddWithValue("@ImportBatchId", batchId);
+                command.Parameters.AddWithValue("@SourceCode", "RPO");
+                command.Parameters.AddWithValue("@RemoteKey", file.Key);
+                command.Parameters.AddWithValue("@RemoteUri", file.DownloadUri.ToString());
+                command.Parameters.AddWithValue("@Status", file.Key == package.Manifest!.Key ? "Downloaded" : "Discovered");
+                command.Parameters.AddWithValue("@SizeBytes", (object?)file.Size ?? DBNull.Value);
+                command.Parameters.AddWithValue("@ETag", (object?)file.ETag ?? DBNull.Value);
+                command.Parameters.AddWithValue("@ModifiedAt", (object?)file.ModifiedAtUtc ?? DBNull.Value);
+                await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+            return batchId;
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            throw;
+        }
+    }
 }
 
 public sealed class SqlRawRecordStore(string connectionString) : IRawRecordStore

@@ -62,6 +62,14 @@ public sealed class RpoExportCatalog(HttpClient httpClient, IOptions<RpoOptions>
     public Task<IReadOnlyList<RemoteFile>> ListDailyFilesAsync(CancellationToken cancellationToken) =>
         ListAsync(options.Value.DailyPrefix, key => key.EndsWith(".json.gz", StringComparison.OrdinalIgnoreCase), cancellationToken);
 
+    public async Task<IReadOnlyList<string>> ReadManifestAsync(RemoteFile manifest, CancellationToken cancellationToken)
+    {
+        var content = await httpClient.GetStringAsync(manifest.DownloadUri, cancellationToken);
+        return content
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToArray();
+    }
+
     private async Task<IReadOnlyList<RemoteFile>> ListAsync(string prefix, Func<string, bool> include, CancellationToken cancellationToken)
     {
         var request = $"?list-type=2&prefix={Uri.EscapeDataString(prefix)}";

@@ -1,0 +1,329 @@
+From 5eb24af9fd19cfa64fdd18b72b0057d07cd235ec Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 25 Aug 2026 11:29:38 -0500
+Subject: [PATCH] Add atomic RPO initialization planning
+
+---
+ README.md                                     |  2 +
+ database/001_CreateFoundation.sql             | 13 ++-
+ database/002_AddInitializationPlanning.sql    | 19 ++++
+ src/RpoHub.Application/Contracts.cs           | 48 ++++++++++
+ src/RpoHub.Infrastructure/RpoClients.cs       |  8 ++
+ .../ServiceCollectionExtensions.cs            |  1 +
+ src/RpoHub.Infrastructure/SqlStores.cs        | 87 +++++++++++++++++++
+ src/RpoHub.Web/Program.cs                     | 13 ++-
+ 8 files changed, 189 insertions(+), 2 deletions(-)
+ create mode 100644 database/002_AddInitializationPlanning.sql
+
+diff --git a/README.md b/README.md
+index ca8795a..5539171 100644
+--- a/README.md
++++ b/README.md
+@@ -15,6 +15,8 @@ Raw source JSON is retained unchanged in `raw.SourceRecord`. Normalization is a
+ 
+ The initialization export is treated as a package: a dated manifest plus all consecutively numbered `.json.gz` parts. `GET /api/import/initialization` previews and validates available packages without downloading or changing database state.
+ 
++After running `database/002_AddInitializationPlanning.sql` on an existing database, `POST /api/import/initialization/{snapshotDate}/start` validates the manifest and atomically records the initialization batch and its files. It does not download the large JSON parts.
++
+ ## First run
+ 
+ 1. Install the .NET 8 SDK and SQL Server.
+diff --git a/database/001_CreateFoundation.sql b/database/001_CreateFoundation.sql
+index a4a6d90..5c4bb91 100644
+--- a/database/001_CreateFoundation.sql
++++ b/database/001_CreateFoundation.sql
+@@ -12,6 +12,7 @@ CREATE TABLE [etl].[ImportBatch]
+ 	[Id]						uniqueidentifier		NOT NULL CONSTRAINT [PK_ImportBatch] PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
+ 	[SourceCode]				varchar(30)				NOT NULL,
+ 	[BatchKind]					varchar(20)				NOT NULL,
++	[SnapshotDate]				date						NULL,
+ 	[Status]					varchar(20)				NOT NULL,
+ 	[StartedAtUtc]				datetime2(3)			NOT NULL CONSTRAINT [DF_ImportBatch_Started] DEFAULT SYSUTCDATETIME(),
+ 	[CompletedAtUtc]			datetime2(3)			NULL,
+@@ -20,6 +21,17 @@ CREATE TABLE [etl].[ImportBatch]
+ 	CONSTRAINT [CK_ImportBatch_Status] CHECK ([Status] IN ('Started', 'Completed', 'Failed', 'Cancelled'))
+ );
+ 
++IF NOT EXISTS
++(
++	SELECT 1
++	FROM [sys].[indexes]
++	WHERE [object_id] = OBJECT_ID(N'[etl].[ImportBatch]')
++	  AND [name] = N'UX_ImportBatch_Source_Snapshot'
++)
++CREATE UNIQUE INDEX [UX_ImportBatch_Source_Snapshot]
++	ON [etl].[ImportBatch] ([SourceCode], [BatchKind], [SnapshotDate])
++	WHERE [SnapshotDate] IS NOT NULL;
++
+ IF OBJECT_ID(N'[etl].[ImportFile]', N'U') IS NULL
+ CREATE TABLE [etl].[ImportFile]
+ (
+@@ -36,7 +48,6 @@ CREATE TABLE [etl].[ImportFile]
+ 	[DiscoveredAtUtc]			datetime2(3)			NOT NULL CONSTRAINT [DF_ImportFile_Discovered] DEFAULT SYSUTCDATETIME(),
+ 	[ImportedAtUtc]				datetime2(3)			NULL,
+ 	[RowCount]					bigint					NULL,
+---	CONSTRAINT [UQ_ImportFile_Source_Key] UNIQUE ([SourceCode], [RemoteKey]),
+ 	[RemoteKeyHash] AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), [RemoteKey]))) PERSISTED,
+ 	CONSTRAINT [UQ_ImportFile_Source_KeyHash] UNIQUE ([SourceCode], [RemoteKeyHash]),
+ 	CONSTRAINT [CK_ImportFile_Status] CHECK ([Status] IN ('Discovered', 'Downloading', 'Downloaded', 'Importing', 'Imported', 'Failed', 'Skipped'))
+diff --git a/database/002_AddInitializationPlanning.sql b/database/002_AddInitializationPlanning.sql
+new file mode 100644
+index 0000000..436ed09
+--- /dev/null
++++ b/database/002_AddInitializationPlanning.sql
+@@ -0,0 +1,19 @@
++SET XACT_ABORT ON;
++BEGIN TRANSACTION;
++
++IF COL_LENGTH(N'[etl].[ImportBatch]', N'SnapshotDate') IS NULL
++ALTER TABLE [etl].[ImportBatch]
++ADD [SnapshotDate] date NULL;
++
++IF NOT EXISTS
++(
++	SELECT 1
++	FROM [sys].[indexes]
++	WHERE [object_id] = OBJECT_ID(N'[etl].[ImportBatch]')
++	  AND [name] = N'UX_ImportBatch_Source_Snapshot'
++)
++CREATE UNIQUE INDEX [UX_ImportBatch_Source_Snapshot]
++	ON [etl].[ImportBatch] ([SourceCode], [BatchKind], [SnapshotDate])
++	WHERE [SnapshotDate] IS NOT NULL;
++
++COMMIT TRANSACTION;
+diff --git a/src/RpoHub.Application/Contracts.cs b/src/RpoHub.Application/Contracts.cs
+index f36efe8..0417698 100644
+--- a/src/RpoHub.Application/Contracts.cs
++++ b/src/RpoHub.Application/Contracts.cs
+@@ -16,6 +16,12 @@ public sealed record InitializationPackage(
+     bool HasContiguousParts,
+     bool IsStructurallyComplete);
+ public sealed record InitializationPreview(ImportReadiness Readiness, IReadOnlyList<InitializationPackage> Packages);
++public sealed record InitializationStartResult(
++    Guid BatchId,
++    DateOnly SnapshotDate,
++    int DataFileCount,
++    long TotalCompressedBytes,
++    string Status);
+ 
+ public interface IRpoApiClient
+ {
+@@ -27,12 +33,14 @@ public interface IRpoExportCatalog
+ {
+     Task<IReadOnlyList<RemoteFile>> ListInitializationFilesAsync(CancellationToken cancellationToken);
+     Task<IReadOnlyList<RemoteFile>> ListDailyFilesAsync(CancellationToken cancellationToken);
++    Task<IReadOnlyList<string>> ReadManifestAsync(RemoteFile manifest, CancellationToken cancellationToken);
+ }
+ 
+ public interface IImportStateStore
+ {
+     Task<ImportReadiness> GetReadinessAsync(CancellationToken cancellationToken);
+     Task RecordDiscoveredFilesAsync(IEnumerable<RemoteFile> files, string batchKind, CancellationToken cancellationToken);
++    Task<Guid?> TryCreateInitializationBatchAsync(InitializationPackage package, CancellationToken cancellationToken);
+ }
+ 
+ public interface IRawRecordStore
+@@ -111,3 +119,43 @@ public sealed partial class GetRpoInitializationPreview(IRpoExportCatalog catalo
+     [GeneratedRegex(@"^batch-init/init_(\d{4}-\d{2}-\d{2})_list\.txt$", RegexOptions.CultureInvariant)]
+     private static partial Regex InitializationManifestPattern();
+ }
++
++public sealed class StartRpoInitialization(
++    GetRpoInitializationPreview previewUseCase,
++    IRpoExportCatalog catalog,
++    IImportStateStore stateStore)
++{
++    public async Task<InitializationStartResult> ExecuteAsync(DateOnly snapshotDate, CancellationToken cancellationToken)
++    {
++        var preview = await previewUseCase.ExecuteAsync(cancellationToken);
++        if (!preview.Readiness.CanInitialize)
++            throw new InvalidOperationException(preview.Readiness.Explanation);
++
++        var package = preview.Packages.SingleOrDefault(item => item.SnapshotDate == snapshotDate)
++            ?? throw new InvalidOperationException($"Initialization snapshot {snapshotDate:yyyy-MM-dd} is not available.");
++        if (!package.IsStructurallyComplete || package.Manifest is null)
++            throw new InvalidOperationException($"Initialization snapshot {snapshotDate:yyyy-MM-dd} is structurally incomplete.");
++
++        var manifestEntries = await catalog.ReadManifestAsync(package.Manifest, cancellationToken);
++        var expectedEntries = package.Parts.Select(item => GetFileName(item.Key)).ToArray();
++        if (!manifestEntries.SequenceEqual(expectedEntries, StringComparer.Ordinal))
++            throw new InvalidOperationException($"Manifest validation failed for initialization snapshot {snapshotDate:yyyy-MM-dd}.");
++
++        var batchId = await stateStore.TryCreateInitializationBatchAsync(package, cancellationToken);
++        if (!batchId.HasValue)
++            throw new InvalidOperationException("Initialization cannot start because database state changed or another initialization request won the lock.");
++
++        return new InitializationStartResult(
++            batchId.Value,
++            package.SnapshotDate,
++            package.Parts.Count,
++            package.TotalCompressedBytes,
++            "Started");
++    }
++
++    private static string GetFileName(string key)
++    {
++        var separator = key.LastIndexOf('/');
++        return separator < 0 ? key : key[(separator + 1)..];
++    }
++}
+diff --git a/src/RpoHub.Infrastructure/RpoClients.cs b/src/RpoHub.Infrastructure/RpoClients.cs
+index 97de141..67a1b19 100644
+--- a/src/RpoHub.Infrastructure/RpoClients.cs
++++ b/src/RpoHub.Infrastructure/RpoClients.cs
+@@ -62,6 +62,14 @@ public sealed class RpoExportCatalog(HttpClient httpClient, IOptions<RpoOptions>
+     public Task<IReadOnlyList<RemoteFile>> ListDailyFilesAsync(CancellationToken cancellationToken) =>
+         ListAsync(options.Value.DailyPrefix, key => key.EndsWith(".json.gz", StringComparison.OrdinalIgnoreCase), cancellationToken);
+ 
++    public async Task<IReadOnlyList<string>> ReadManifestAsync(RemoteFile manifest, CancellationToken cancellationToken)
++    {
++        var content = await httpClient.GetStringAsync(manifest.DownloadUri, cancellationToken);
++        return content
++            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
++            .ToArray();
++    }
++
+     private async Task<IReadOnlyList<RemoteFile>> ListAsync(string prefix, Func<string, bool> include, CancellationToken cancellationToken)
+     {
+         var request = $"?list-type=2&prefix={Uri.EscapeDataString(prefix)}";
+diff --git a/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs b/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
+index 0c0bf82..a66f2fa 100644
+--- a/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
++++ b/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
+@@ -20,6 +20,7 @@ public static class ServiceCollectionExtensions
+         services.AddSingleton<IRawRecordStore>(_ => new SqlRawRecordStore(connectionString));
+         services.AddTransient<DiscoverRpoUpdates>();
+         services.AddTransient<GetRpoInitializationPreview>();
++        services.AddTransient<StartRpoInitialization>();
+         return services;
+     }
+ }
+diff --git a/src/RpoHub.Infrastructure/SqlStores.cs b/src/RpoHub.Infrastructure/SqlStores.cs
+index 94eb8af..cf83017 100644
+--- a/src/RpoHub.Infrastructure/SqlStores.cs
++++ b/src/RpoHub.Infrastructure/SqlStores.cs
+@@ -47,6 +47,93 @@ public sealed class SqlImportStateStore(string connectionString) : IImportStateS
+             await command.ExecuteNonQueryAsync(cancellationToken);
+         }
+     }
++
++    public async Task<Guid?> TryCreateInitializationBatchAsync(InitializationPackage package, CancellationToken cancellationToken)
++    {
++        const string createBatchSql = """
++            DECLARE @LockResult int;
++            EXEC @LockResult = sys.sp_getapplock
++                @Resource = N'RpoHub:RPO:Initialization',
++                @LockMode = N'Exclusive',
++                @LockOwner = N'Transaction',
++                @LockTimeout = 0;
++
++            IF @LockResult < 0
++            BEGIN
++                SELECT CAST(NULL AS uniqueidentifier);
++                RETURN;
++            END;
++
++            IF EXISTS (SELECT 1 FROM [raw].[SourceRecord] WITH (UPDLOCK, HOLDLOCK))
++               OR EXISTS (SELECT 1 FROM [etl].[ImportBatch] WITH (UPDLOCK, HOLDLOCK))
++            BEGIN
++                SELECT CAST(NULL AS uniqueidentifier);
++                RETURN;
++            END;
++
++            INSERT INTO [etl].[ImportBatch]
++                ([SourceCode], [BatchKind], [SnapshotDate], [Status])
++            OUTPUT INSERTED.[Id]
++            VALUES
++                ('RPO', 'Initialization', @SnapshotDate, 'Started');
++            """;
++
++        const string registerFileSql = """
++            MERGE [etl].[ImportFile] WITH (HOLDLOCK) AS [target]
++            USING (SELECT @SourceCode AS [SourceCode], @RemoteKey AS [RemoteKey]) AS [source]
++               ON [target].[SourceCode] = [source].[SourceCode]
++              AND [target].[RemoteKey] = [source].[RemoteKey]
++            WHEN MATCHED THEN
++                UPDATE SET
++                    [ImportBatchId] = @ImportBatchId,
++                    [RemoteUri] = @RemoteUri,
++                    [BatchKind] = 'Initialization',
++                    [Status] = @Status,
++                    [SizeBytes] = @SizeBytes,
++                    [ETag] = @ETag,
++                    [SourceModifiedAtUtc] = @ModifiedAt
++            WHEN NOT MATCHED THEN
++                INSERT ([ImportBatchId], [SourceCode], [RemoteKey], [RemoteUri], [BatchKind], [Status], [SizeBytes], [ETag], [SourceModifiedAtUtc])
++                VALUES (@ImportBatchId, @SourceCode, @RemoteKey, @RemoteUri, 'Initialization', @Status, @SizeBytes, @ETag, @ModifiedAt);
++            """;
++
++        await using var connection = new SqlConnection(connectionString);
++        await connection.OpenAsync(cancellationToken);
++        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, cancellationToken);
++        try
++        {
++            await using var createCommand = new SqlCommand(createBatchSql, connection, transaction);
++            createCommand.Parameters.AddWithValue("@SnapshotDate", package.SnapshotDate.ToDateTime(TimeOnly.MinValue));
++            var scalar = await createCommand.ExecuteScalarAsync(cancellationToken);
++            if (scalar is not Guid batchId)
++            {
++                await transaction.RollbackAsync(cancellationToken);
++                return null;
++            }
++
++            foreach (var file in package.Parts.Append(package.Manifest!))
++            {
++                await using var command = new SqlCommand(registerFileSql, connection, transaction);
++                command.Parameters.AddWithValue("@ImportBatchId", batchId);
++                command.Parameters.AddWithValue("@SourceCode", "RPO");
++                command.Parameters.AddWithValue("@RemoteKey", file.Key);
++                command.Parameters.AddWithValue("@RemoteUri", file.DownloadUri.ToString());
++                command.Parameters.AddWithValue("@Status", file.Key == package.Manifest!.Key ? "Downloaded" : "Discovered");
++                command.Parameters.AddWithValue("@SizeBytes", (object?)file.Size ?? DBNull.Value);
++                command.Parameters.AddWithValue("@ETag", (object?)file.ETag ?? DBNull.Value);
++                command.Parameters.AddWithValue("@ModifiedAt", (object?)file.ModifiedAtUtc ?? DBNull.Value);
++                await command.ExecuteNonQueryAsync(cancellationToken);
++            }
++
++            await transaction.CommitAsync(cancellationToken);
++            return batchId;
++        }
++        catch
++        {
++            await transaction.RollbackAsync(CancellationToken.None);
++            throw;
++        }
++    }
+ }
+ 
+ public sealed class SqlRawRecordStore(string connectionString) : IRawRecordStore
+diff --git a/src/RpoHub.Web/Program.cs b/src/RpoHub.Web/Program.cs
+index e6ceb2b..046acb1 100644
+--- a/src/RpoHub.Web/Program.cs
++++ b/src/RpoHub.Web/Program.cs
+@@ -9,11 +9,22 @@ app.MapGet("/", () => Results.Content("""
+ <!doctype html><html lang="sk"><meta charset="utf-8"><title>RpoHub</title>
+ <style>body{font:16px system-ui;max-width:880px;margin:4rem auto;padding:0 1rem;color:#172033}code{background:#eef2f7;padding:.15rem .35rem;border-radius:.25rem}</style>
+ <h1>RpoHub</h1><p>Foundation is running.</p>
+-<ul><li><code>GET /api/status</code> — initialization safety state</li><li><code>GET /api/import/initialization</code> — preview official initialization packages</li><li><code>GET /api/rpo/search/{ico}</code> — live RPO verification</li><li><code>POST /api/import/discover</code> — discover official daily files</li></ul></html>
++<ul><li><code>GET /api/status</code> — initialization safety state</li><li><code>GET /api/import/initialization</code> — preview official initialization packages</li><li><code>POST /api/import/initialization/{snapshotDate}/start</code> — validate and prepare initialization</li><li><code>GET /api/rpo/search/{ico}</code> — live RPO verification</li><li><code>POST /api/import/discover</code> — discover official daily files</li></ul></html>
+ """, "text/html; charset=utf-8"));
+ 
+ app.MapGet("/api/status", (IImportStateStore store, CancellationToken ct) => store.GetReadinessAsync(ct));
+ app.MapGet("/api/import/initialization", (GetRpoInitializationPreview useCase, CancellationToken ct) => useCase.ExecuteAsync(ct));
++app.MapPost("/api/import/initialization/{snapshotDate}/start", async (DateOnly snapshotDate, StartRpoInitialization useCase, CancellationToken ct) =>
++{
++    try
++    {
++        return Results.Ok(await useCase.ExecuteAsync(snapshotDate, ct));
++    }
++    catch (InvalidOperationException exception)
++    {
++        return Results.Conflict(new { error = exception.Message });
++    }
++});
+ app.MapGet("/api/rpo/search/{ico}", (string ico, IRpoApiClient client, CancellationToken ct) => client.SearchByIcoAsync(ico, ct));
+ app.MapPost("/api/import/discover", async (DiscoverRpoUpdates useCase, CancellationToken ct) => Results.Ok(new { discovered = await useCase.ExecuteAsync(ct) }));
+ app.Run();
+-- 
+2.51.1
+
