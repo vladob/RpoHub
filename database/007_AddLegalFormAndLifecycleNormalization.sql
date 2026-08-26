@@ -17,10 +17,13 @@ BEGIN TRY
 		  AND [name] = N'IX_RawSourceRecord_LegalLifecyclePending'
 	)
 	BEGIN
-		CREATE INDEX [IX_RawSourceRecord_LegalLifecyclePending]
-			ON [raw].[SourceRecord] ([SourceCode], [Id])
-			INCLUDE ([SourceEntityId], [NormalizedAtUtc], [LegalLifecycleNormalizedAtUtc])
-			WHERE [LegalLifecycleNormalizedAtUtc] IS NULL;
+		EXEC
+		(
+			N'CREATE INDEX [IX_RawSourceRecord_LegalLifecyclePending]
+			  ON [raw].[SourceRecord] ([SourceCode], [Id])
+			  INCLUDE ([SourceEntityId], [NormalizedAtUtc], [LegalLifecycleNormalizedAtUtc])
+			  WHERE [LegalLifecycleNormalizedAtUtc] IS NULL;'
+		);
 	END;
 
 	IF OBJECT_ID(N'[registry].[SubjectLifecycle]', N'U') IS NULL
