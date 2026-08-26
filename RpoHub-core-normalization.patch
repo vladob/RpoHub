@@ -1,0 +1,546 @@
+From a436361b3c0747a20e49b3144f16989b2f007598 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 25 Aug 2026 12:51:40 -0500
+Subject: [PATCH] Add restartable RPO core normalization
+
+---
+ README.md                                     |   4 +-
+ database/005_AddRpoCoreNormalization.sql      | 333 ++++++++++++++++++
+ src/RpoHub.Application/Contracts.cs           |  11 +
+ src/RpoHub.Infrastructure/RpoOptions.cs       |   2 +
+ .../ServiceCollectionExtensions.cs            |   1 +
+ src/RpoHub.Infrastructure/SqlStores.cs        |  24 ++
+ src/RpoHub.Worker/Program.cs                  |   1 +
+ src/RpoHub.Worker/RpoNormalizationWorker.cs   |  52 +++
+ src/RpoHub.Worker/appsettings.json            |   4 +-
+ 9 files changed, 430 insertions(+), 2 deletions(-)
+ create mode 100644 database/005_AddRpoCoreNormalization.sql
+ create mode 100644 src/RpoHub.Worker/RpoNormalizationWorker.cs
+
+diff --git a/README.md b/README.md
+index 416d905..ea71e6b 100644
+--- a/README.md
++++ b/README.md
+@@ -23,6 +23,8 @@ After running `database/003_AddImportFileExecutionState.sql`, `POST /api/import/
+ 
+ The Worker automatically resumes a `Started` initialization batch, importing one file at a time. A database application lock plus the persisted `Importing` status prevents concurrent Web and Worker claims.
+ 
++After running `database/005_AddRpoCoreNormalization.sql`, the Worker normalizes the completed initialization snapshot in bounded, restartable batches. The first normalization slice creates one subject per RPO source entity, records the source entity ID and all IČO validity periods, preserves every historical name in `registry.SubjectName`, and selects the current or latest name for `registry.Subject.DisplayName`. Registry changes and `raw.SourceRecord.NormalizedAtUtc` are committed atomically for each batch.
++
+ ## First run
+ 
+ 1. Install the .NET 8 SDK and SQL Server.
+@@ -50,4 +52,4 @@ The worker never assumes that missing ETL metadata means an empty database. Init
+ 
+ ## Next vertical slice
+ 
+-Implement streaming `.json.gz` download into `raw.SourceRecord`, using a bounded batch and `SqlBulkCopy`, then normalize names and identifiers. The old `PgDumpImporter` project remains useful as a reference for sequential streaming, progress, cancellation, and bulk-copy patterns—not for its PostgreSQL COPY parser.
++Normalize legal forms, establishment and termination dates, addresses, activities, and organization-unit relationships. The old `PgDumpImporter` project remains useful as a reference for sequential streaming, progress, cancellation, and bulk-copy patterns—not for its PostgreSQL COPY parser.
+diff --git a/database/005_AddRpoCoreNormalization.sql b/database/005_AddRpoCoreNormalization.sql
+new file mode 100644
+index 0000000..6138ebe
+--- /dev/null
++++ b/database/005_AddRpoCoreNormalization.sql
+@@ -0,0 +1,333 @@
++SET XACT_ABORT ON;
++
++BEGIN TRY
++	BEGIN TRANSACTION;
++
++	IF OBJECT_ID(N'[registry].[SubjectName]', N'U') IS NULL
++	BEGIN
++		CREATE TABLE [registry].[SubjectName]
++		(
++			[Id]						bigint IDENTITY(1,1)	NOT NULL CONSTRAINT [PK_SubjectName] PRIMARY KEY,
++			[SubjectId]				uniqueidentifier		NOT NULL CONSTRAINT [FK_SubjectName_Subject] REFERENCES [registry].[Subject] ([Id]),
++			[NameValue]				nvarchar(1000)			NOT NULL,
++			[SourceCode]				varchar(30)				NOT NULL,
++			[ValidFrom]				date					NULL,
++			[ValidTo]				date					NULL,
++			[FirstObservedAtUtc]		datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectName_First] DEFAULT SYSUTCDATETIME(),
++			[LastObservedAtUtc]		datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectName_Last] DEFAULT SYSUTCDATETIME(),
++			[NameHash] AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), [NameValue]))) PERSISTED,
++			CONSTRAINT [CK_SubjectName_Validity] CHECK ([ValidTo] IS NULL OR [ValidFrom] IS NULL OR [ValidTo] >= [ValidFrom])
++		);
++
++		CREATE UNIQUE INDEX [UX_SubjectName_Attribution]
++			ON [registry].[SubjectName] ([SubjectId], [SourceCode], [NameHash], [ValidFrom]);
++
++		CREATE INDEX [IX_SubjectName_Current]
++			ON [registry].[SubjectName] ([SubjectId], [ValidTo], [ValidFrom])
++			INCLUDE ([NameValue], [SourceCode]);
++	END;
++
++	COMMIT TRANSACTION;
++END TRY
++BEGIN CATCH
++	IF @@TRANCOUNT > 0
++		ROLLBACK TRANSACTION;
++
++	THROW;
++END CATCH;
++GO
++
++CREATE OR ALTER PROCEDURE [etl].[NormalizeRpoCoreBatch]
++	@BatchSize int = 5000
++AS
++BEGIN
++	SET NOCOUNT ON;
++	SET XACT_ABORT ON;
++
++	IF @BatchSize < 1 OR @BatchSize > 20000
++		THROW 51005, 'Batch size must be between 1 and 20000.', 1;
++
++	DECLARE @NormalizedRecords int = 0;
++	DECLARE @InsertedSubjects int = 0;
++	DECLARE @InsertedIdentifiers int = 0;
++	DECLARE @InsertedNames int = 0;
++
++	BEGIN TRY
++		BEGIN TRANSACTION;
++
++		DECLARE @LockResult int;
++		EXEC @LockResult = [sys].[sp_getapplock]
++			@Resource = N'RpoHub:RPO:CoreNormalization',
++			@LockMode = N'Exclusive',
++			@LockOwner = N'Transaction',
++			@LockTimeout = 0;
++
++		IF @LockResult < 0
++		BEGIN
++			ROLLBACK TRANSACTION;
++			SELECT
++				CAST(0 AS int) AS [NormalizedRecords],
++				CAST(0 AS int) AS [InsertedSubjects],
++				CAST(0 AS int) AS [InsertedIdentifiers],
++				CAST(0 AS int) AS [InsertedNames],
++				CAST(1 AS bit) AS [LockUnavailable];
++			RETURN;
++		END;
++
++		IF NOT EXISTS
++		(
++			SELECT 1
++			FROM [etl].[ImportBatch]
++			WHERE [SourceCode] = 'RPO'
++			  AND [BatchKind] = 'Initialization'
++			  AND [Status] = 'Completed'
++		)
++		BEGIN
++			COMMIT TRANSACTION;
++			SELECT
++				CAST(0 AS int) AS [NormalizedRecords],
++				CAST(0 AS int) AS [InsertedSubjects],
++				CAST(0 AS int) AS [InsertedIdentifiers],
++				CAST(0 AS int) AS [InsertedNames],
++				CAST(0 AS bit) AS [LockUnavailable];
++			RETURN;
++		END;
++
++		CREATE TABLE [#Pending]
++		(
++			[RawRecordId]		bigint			NOT NULL CONSTRAINT [PK_Pending] PRIMARY KEY,
++			[SourceEntityId]	varchar(100)	NOT NULL,
++			[JsonData]			varchar(max) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
++			[DisplayName]		nvarchar(1000)	NULL
++		);
++
++		INSERT INTO [#Pending]
++			([RawRecordId], [SourceEntityId], [JsonData], [DisplayName])
++		SELECT TOP (@BatchSize)
++			[raw].[Id],
++			[raw].[SourceEntityId],
++			[raw].[JsonData],
++			[displayName].[NameValue]
++		FROM [raw].[SourceRecord] AS [raw] WITH (UPDLOCK, READPAST, ROWLOCK)
++		OUTER APPLY
++		(
++			SELECT TOP (1)
++				CONVERT(nvarchar(1000), JSON_VALUE([name].[value], '$.value')) AS [NameValue]
++			FROM OPENJSON([raw].[JsonData], '$.fullNames') AS [name]
++			WHERE NULLIF(JSON_VALUE([name].[value], '$.value'), '') IS NOT NULL
++			ORDER BY
++				CASE WHEN JSON_VALUE([name].[value], '$.validTo') IS NULL THEN 0 ELSE 1 END,
++				TRY_CONVERT(date, JSON_VALUE([name].[value], '$.validFrom')) DESC,
++				[name].[key] DESC
++		) AS [displayName]
++		WHERE [raw].[SourceCode] = 'RPO'
++		  AND [raw].[NormalizedAtUtc] IS NULL
++		ORDER BY [raw].[Id];
++
++		IF NOT EXISTS (SELECT 1 FROM [#Pending])
++		BEGIN
++			COMMIT TRANSACTION;
++			SELECT
++				CAST(0 AS int) AS [NormalizedRecords],
++				CAST(0 AS int) AS [InsertedSubjects],
++				CAST(0 AS int) AS [InsertedIdentifiers],
++				CAST(0 AS int) AS [InsertedNames],
++				CAST(0 AS bit) AS [LockUnavailable];
++			RETURN;
++		END;
++
++		CREATE TABLE [#SubjectMap]
++		(
++			[RawRecordId]		bigint			NOT NULL CONSTRAINT [PK_SubjectMap] PRIMARY KEY,
++			[SourceEntityId]	varchar(100)	NOT NULL,
++			[SubjectId]			uniqueidentifier NOT NULL
++		);
++
++		INSERT INTO [#SubjectMap]
++			([RawRecordId], [SourceEntityId], [SubjectId])
++		SELECT
++			[pending].[RawRecordId],
++			[pending].[SourceEntityId],
++			[source].[SubjectId]
++		FROM [#Pending] AS [pending]
++		INNER JOIN [registry].[SourceRecord] AS [source]
++			ON [source].[SourceCode] = 'RPO'
++		   AND [source].[SourceEntityId] = [pending].[SourceEntityId]
++		WHERE [source].[SubjectId] IS NOT NULL;
++
++		MERGE [registry].[Subject] AS [target]
++		USING
++		(
++			SELECT
++				[pending].[RawRecordId],
++				[pending].[SourceEntityId],
++				[pending].[DisplayName]
++			FROM [#Pending] AS [pending]
++			WHERE NOT EXISTS
++			(
++				SELECT 1
++				FROM [#SubjectMap] AS [mapped]
++				WHERE [mapped].[RawRecordId] = [pending].[RawRecordId]
++			)
++		) AS [source]
++		ON 1 = 0
++		WHEN NOT MATCHED THEN
++			INSERT ([DisplayName])
++			VALUES ([source].[DisplayName])
++		OUTPUT
++			[source].[RawRecordId],
++			[source].[SourceEntityId],
++			[inserted].[Id]
++		INTO [#SubjectMap]
++			([RawRecordId], [SourceEntityId], [SubjectId]);
++
++		SET @InsertedSubjects = @@ROWCOUNT;
++
++		MERGE [registry].[SourceRecord] WITH (HOLDLOCK) AS [target]
++		USING [#SubjectMap] AS [source]
++		   ON [target].[SourceCode] = 'RPO'
++		  AND [target].[SourceEntityId] = [source].[SourceEntityId]
++		WHEN MATCHED THEN
++			UPDATE SET
++				[SubjectId] = COALESCE([target].[SubjectId], [source].[SubjectId]),
++				[CurrentRawRecordId] = [source].[RawRecordId],
++				[IsCurrent] = 1
++		WHEN NOT MATCHED THEN
++			INSERT ([SourceCode], [SourceEntityId], [SubjectId], [CurrentRawRecordId], [IsCurrent])
++			VALUES ('RPO', [source].[SourceEntityId], [source].[SubjectId], [source].[RawRecordId], 1);
++
++		UPDATE [subject]
++		SET
++			[DisplayName] = [pending].[DisplayName],
++			[UpdatedAtUtc] = SYSUTCDATETIME()
++		FROM [registry].[Subject] AS [subject]
++		INNER JOIN [#SubjectMap] AS [mapped]
++			ON [mapped].[SubjectId] = [subject].[Id]
++		INNER JOIN [#Pending] AS [pending]
++			ON [pending].[RawRecordId] = [mapped].[RawRecordId]
++		WHERE [pending].[DisplayName] IS NOT NULL;
++
++		INSERT INTO [registry].[SubjectIdentifier]
++			([SubjectId], [IdentifierTypeCode], [IdentifierValue], [SourceCode], [ValidFrom], [ValidTo], [IsVerified])
++		SELECT DISTINCT
++			[mapped].[SubjectId],
++			'SOURCE_ENTITY_ID',
++			CONVERT(nvarchar(100), [mapped].[SourceEntityId]),
++			'RPO',
++			NULL,
++			NULL,
++			1
++		FROM [#SubjectMap] AS [mapped]
++		WHERE NOT EXISTS
++		(
++			SELECT 1
++			FROM [registry].[SubjectIdentifier] AS [existing]
++			WHERE [existing].[SubjectId] = [mapped].[SubjectId]
++			  AND [existing].[IdentifierTypeCode] = 'SOURCE_ENTITY_ID'
++			  AND [existing].[IdentifierValue] = CONVERT(nvarchar(100), [mapped].[SourceEntityId])
++			  AND [existing].[SourceCode] = 'RPO'
++			  AND [existing].[ValidFrom] IS NULL
++		);
++
++		SET @InsertedIdentifiers = @@ROWCOUNT;
++
++		INSERT INTO [registry].[SubjectIdentifier]
++			([SubjectId], [IdentifierTypeCode], [IdentifierValue], [SourceCode], [ValidFrom], [ValidTo], [IsVerified])
++		SELECT DISTINCT
++			[mapped].[SubjectId],
++			'ICO',
++			[identifier].[IdentifierValue],
++			'RPO',
++			[identifier].[ValidFrom],
++			[identifier].[ValidTo],
++			1
++		FROM [#Pending] AS [pending]
++		INNER JOIN [#SubjectMap] AS [mapped]
++			ON [mapped].[RawRecordId] = [pending].[RawRecordId]
++		CROSS APPLY OPENJSON([pending].[JsonData], '$.identifiers') AS [jsonIdentifier]
++		CROSS APPLY
++		(
++			SELECT
++				CONVERT(nvarchar(100), JSON_VALUE([jsonIdentifier].[value], '$.value')) AS [IdentifierValue],
++				TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validFrom')) AS [ValidFrom],
++				TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validTo')) AS [ValidTo]
++		) AS [identifier]
++		WHERE NULLIF([identifier].[IdentifierValue], '') IS NOT NULL
++		  AND NOT EXISTS
++		(
++			SELECT 1
++			FROM [registry].[SubjectIdentifier] AS [existing]
++			WHERE [existing].[SubjectId] = [mapped].[SubjectId]
++			  AND [existing].[IdentifierTypeCode] = 'ICO'
++			  AND [existing].[IdentifierValue] = [identifier].[IdentifierValue]
++			  AND [existing].[SourceCode] = 'RPO'
++			  AND
++			  (
++				[existing].[ValidFrom] = [identifier].[ValidFrom]
++				OR ([existing].[ValidFrom] IS NULL AND [identifier].[ValidFrom] IS NULL)
++			  )
++		);
++
++		SET @InsertedIdentifiers += @@ROWCOUNT;
++
++		INSERT INTO [registry].[SubjectName]
++			([SubjectId], [NameValue], [SourceCode], [ValidFrom], [ValidTo])
++		SELECT DISTINCT
++			[mapped].[SubjectId],
++			[name].[NameValue],
++			'RPO',
++			[name].[ValidFrom],
++			[name].[ValidTo]
++		FROM [#Pending] AS [pending]
++		INNER JOIN [#SubjectMap] AS [mapped]
++			ON [mapped].[RawRecordId] = [pending].[RawRecordId]
++		CROSS APPLY OPENJSON([pending].[JsonData], '$.fullNames') AS [jsonName]
++		CROSS APPLY
++		(
++			SELECT
++				CONVERT(nvarchar(1000), JSON_VALUE([jsonName].[value], '$.value')) AS [NameValue],
++				TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validFrom')) AS [ValidFrom],
++				TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validTo')) AS [ValidTo]
++		) AS [name]
++		WHERE NULLIF([name].[NameValue], '') IS NOT NULL
++		  AND NOT EXISTS
++		(
++			SELECT 1
++			FROM [registry].[SubjectName] AS [existing]
++			WHERE [existing].[SubjectId] = [mapped].[SubjectId]
++			  AND [existing].[SourceCode] = 'RPO'
++			  AND [existing].[NameHash] = CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), [name].[NameValue])))
++			  AND
++			  (
++				[existing].[ValidFrom] = [name].[ValidFrom]
++				OR ([existing].[ValidFrom] IS NULL AND [name].[ValidFrom] IS NULL)
++			  )
++		);
++
++		SET @InsertedNames = @@ROWCOUNT;
++
++		UPDATE [raw]
++		SET [NormalizedAtUtc] = SYSUTCDATETIME()
++		FROM [raw].[SourceRecord] AS [raw]
++		INNER JOIN [#Pending] AS [pending]
++			ON [pending].[RawRecordId] = [raw].[Id];
++
++		SET @NormalizedRecords = @@ROWCOUNT;
++
++		COMMIT TRANSACTION;
++
++		SELECT
++			@NormalizedRecords AS [NormalizedRecords],
++			@InsertedSubjects AS [InsertedSubjects],
++			@InsertedIdentifiers AS [InsertedIdentifiers],
++			@InsertedNames AS [InsertedNames],
++			CAST(0 AS bit) AS [LockUnavailable];
++	END TRY
++	BEGIN CATCH
++		IF @@TRANCOUNT > 0
++			ROLLBACK TRANSACTION;
++
++		THROW;
++	END CATCH;
++END;
++GO
+diff --git a/src/RpoHub.Application/Contracts.cs b/src/RpoHub.Application/Contracts.cs
+index 6688636..5b3ba47 100644
+--- a/src/RpoHub.Application/Contracts.cs
++++ b/src/RpoHub.Application/Contracts.cs
+@@ -29,6 +29,12 @@ public sealed record InitializationFileImportResult(
+     long RowsInserted,
+     string Status,
+     bool BatchCompleted);
++public sealed record RpoNormalizationBatchResult(
++    int NormalizedRecords,
++    int InsertedSubjects,
++    int InsertedIdentifiers,
++    int InsertedNames,
++    bool LockUnavailable);
+ 
+ public interface IRpoApiClient
+ {
+@@ -61,6 +67,11 @@ public interface IInitializationFileImporter
+     Task<InitializationFileImportResult?> ImportNextStartedBatchAsync(CancellationToken cancellationToken);
+ }
+ 
++public interface IRpoCoreNormalizer
++{
++    Task<RpoNormalizationBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken);
++}
++
+ public sealed class DiscoverRpoUpdates(IRpoExportCatalog catalog, IImportStateStore stateStore)
+ {
+     public async Task<int> ExecuteAsync(CancellationToken cancellationToken)
+diff --git a/src/RpoHub.Infrastructure/RpoOptions.cs b/src/RpoHub.Infrastructure/RpoOptions.cs
+index 87f335f..9ff03ec 100644
+--- a/src/RpoHub.Infrastructure/RpoOptions.cs
++++ b/src/RpoHub.Infrastructure/RpoOptions.cs
+@@ -9,4 +9,6 @@ public sealed class RpoOptions
+     public string DailyPrefix { get; set; } = "batch-daily/";
+     public TimeSpan DiscoveryInterval { get; set; } = TimeSpan.FromHours(24);
+     public TimeSpan InitializationPollInterval { get; set; } = TimeSpan.FromSeconds(30);
++    public int NormalizationBatchSize { get; set; } = 5000;
++    public TimeSpan NormalizationPollInterval { get; set; } = TimeSpan.FromSeconds(30);
+ }
+diff --git a/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs b/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
+index 7d41d07..fe249e4 100644
+--- a/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
++++ b/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
+@@ -19,6 +19,7 @@ public static class ServiceCollectionExtensions
+             ?? throw new InvalidOperationException("ConnectionStrings:Registers is required.");
+         services.AddSingleton<IImportStateStore>(_ => new SqlImportStateStore(connectionString));
+         services.AddSingleton<IRawRecordStore>(_ => new SqlRawRecordStore(connectionString));
++        services.AddSingleton<IRpoCoreNormalizer>(_ => new SqlRpoCoreNormalizer(connectionString));
+         services.AddTransient<DiscoverRpoUpdates>();
+         services.AddTransient<GetRpoInitializationPreview>();
+         services.AddTransient<StartRpoInitialization>();
+diff --git a/src/RpoHub.Infrastructure/SqlStores.cs b/src/RpoHub.Infrastructure/SqlStores.cs
+index cf83017..493a262 100644
+--- a/src/RpoHub.Infrastructure/SqlStores.cs
++++ b/src/RpoHub.Infrastructure/SqlStores.cs
+@@ -156,3 +156,27 @@ public sealed class SqlRawRecordStore(string connectionString) : IRawRecordStore
+         await command.ExecuteNonQueryAsync(cancellationToken);
+     }
+ }
++
++public sealed class SqlRpoCoreNormalizer(string connectionString) : IRpoCoreNormalizer
++{
++    public async Task<RpoNormalizationBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken)
++    {
++        await using var connection = new SqlConnection(connectionString);
++        await connection.OpenAsync(cancellationToken);
++        await using var command = new SqlCommand("[etl].[NormalizeRpoCoreBatch]", connection)
++        {
++            CommandType = System.Data.CommandType.StoredProcedure,
++            CommandTimeout = 300
++        };
++        command.Parameters.Add("@BatchSize", System.Data.SqlDbType.Int).Value = batchSize;
++
++        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
++        await reader.ReadAsync(cancellationToken);
++        return new RpoNormalizationBatchResult(
++            reader.GetInt32(0),
++            reader.GetInt32(1),
++            reader.GetInt32(2),
++            reader.GetInt32(3),
++            reader.GetBoolean(4));
++    }
++}
+diff --git a/src/RpoHub.Worker/Program.cs b/src/RpoHub.Worker/Program.cs
+index e360b13..69e7151 100644
+--- a/src/RpoHub.Worker/Program.cs
++++ b/src/RpoHub.Worker/Program.cs
+@@ -5,4 +5,5 @@ var builder = Host.CreateApplicationBuilder(args);
+ builder.Services.AddRpoHubInfrastructure(builder.Configuration);
+ builder.Services.AddHostedService<UpdateDiscoveryWorker>();
+ builder.Services.AddHostedService<InitializationImportWorker>();
++builder.Services.AddHostedService<RpoNormalizationWorker>();
+ await builder.Build().RunAsync();
+diff --git a/src/RpoHub.Worker/RpoNormalizationWorker.cs b/src/RpoHub.Worker/RpoNormalizationWorker.cs
+new file mode 100644
+index 0000000..7ca29f5
+--- /dev/null
++++ b/src/RpoHub.Worker/RpoNormalizationWorker.cs
+@@ -0,0 +1,52 @@
++using Microsoft.Extensions.Options;
++using RpoHub.Application;
++using RpoHub.Infrastructure;
++
++namespace RpoHub.Worker;
++
++public sealed class RpoNormalizationWorker(
++    IRpoCoreNormalizer normalizer,
++    IOptions<RpoOptions> options,
++    ILogger<RpoNormalizationWorker> logger) : BackgroundService
++{
++    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
++    {
++        while (!stoppingToken.IsCancellationRequested)
++        {
++            try
++            {
++                var result = await normalizer.NormalizeNextBatchAsync(
++                    options.Value.NormalizationBatchSize,
++                    stoppingToken);
++
++                if (result.LockUnavailable)
++                {
++                    await Task.Delay(options.Value.NormalizationPollInterval, stoppingToken);
++                    continue;
++                }
++
++                if (result.NormalizedRecords == 0)
++                {
++                    await Task.Delay(options.Value.NormalizationPollInterval, stoppingToken);
++                    continue;
++                }
++
++                logger.LogInformation(
++                    "Normalized {NormalizedRecords} RPO records: {InsertedSubjects} subjects, {InsertedIdentifiers} identifiers, {InsertedNames} names inserted.",
++                    result.NormalizedRecords,
++                    result.InsertedSubjects,
++                    result.InsertedIdentifiers,
++                    result.InsertedNames);
++            }
++            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
++            {
++                break;
++            }
++            catch (Exception exception)
++            {
++                logger.LogError(exception, "RPO normalization iteration failed; processing will resume after the polling interval.");
++                await Task.Delay(options.Value.NormalizationPollInterval, stoppingToken);
++            }
++        }
++    }
++}
+diff --git a/src/RpoHub.Worker/appsettings.json b/src/RpoHub.Worker/appsettings.json
+index 5d1ee4d..c5c0343 100644
+--- a/src/RpoHub.Worker/appsettings.json
++++ b/src/RpoHub.Worker/appsettings.json
+@@ -6,6 +6,8 @@
+     "InitializationPrefix": "batch-init/",
+     "DailyPrefix": "batch-daily/",
+     "DiscoveryInterval": "1.00:00:00",
+-    "InitializationPollInterval": "00:00:30"
++    "InitializationPollInterval": "00:00:30",
++    "NormalizationBatchSize": 5000,
++    "NormalizationPollInterval": "00:00:30"
+   }
+ }
+-- 
+2.51.1
+

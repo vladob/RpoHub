@@ -1,0 +1,236 @@
+From f103d302e12e245c746870895feb25a9aef55217 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 26 Aug 2026 14:08:27 +0530
+Subject: [PATCH] Backfill initial conflict observations
+
+---
+ README.md                                     |   2 +
+ ...06_BackfillInitialConflictObservations.sql | 203 ++++++++++++++++++
+ 2 files changed, 205 insertions(+)
+ create mode 100644 database/006_BackfillInitialConflictObservations.sql
+
+diff --git a/README.md b/README.md
+index ea71e6b..63ed5c1 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,8 @@ The Worker automatically resumes a `Started` initialization batch, importing one
+ 
+ After running `database/005_AddRpoCoreNormalization.sql`, the Worker normalizes the completed initialization snapshot in bounded, restartable batches. The first normalization slice creates one subject per RPO source entity, records the source entity ID and all IČO validity periods, preserves every historical name in `registry.SubjectName`, and selects the current or latest name for `registry.Subject.DisplayName`. Registry changes and `raw.SourceRecord.NormalizedAtUtc` are committed atomically for each batch.
+ 
++`database/006_BackfillInitialConflictObservations.sql` idempotently backfills conflicting-`ValidTo` data-quality observations for the first 75,020 records that were normalized before those rules were deployed during development.
++
+ ## First run
+ 
+ 1. Install the .NET 8 SDK and SQL Server.
+diff --git a/database/006_BackfillInitialConflictObservations.sql b/database/006_BackfillInitialConflictObservations.sql
+new file mode 100644
+index 0000000..f4f9345
+--- /dev/null
++++ b/database/006_BackfillInitialConflictObservations.sql
+@@ -0,0 +1,203 @@
++SET XACT_ABORT ON;
++
++BEGIN TRY
++	BEGIN TRANSACTION;
++
++	DECLARE @LockResult int;
++	DECLARE @InsertedIdentifierObservations int = 0;
++	DECLARE @InsertedNameObservations int = 0;
++
++	EXEC @LockResult = [sys].[sp_getapplock]
++		@Resource = N'RpoHub:RPO:CoreNormalization',
++		@LockMode = N'Exclusive',
++		@LockOwner = N'Transaction',
++		@LockTimeout = 60000;
++
++	IF @LockResult < 0
++		THROW 51006, 'Could not acquire the RPO core-normalization lock for data-quality backfill.', 1;
++
++	CREATE TABLE [#BackfillRaw]
++	(
++		[RawRecordId]		bigint			NOT NULL CONSTRAINT [PK_BackfillRaw] PRIMARY KEY,
++		[SourceEntityId]	varchar(100) COLLATE DATABASE_DEFAULT NOT NULL,
++		[SubjectId]			uniqueidentifier NOT NULL
++	);
++
++	INSERT INTO [#BackfillRaw]
++		([RawRecordId], [SourceEntityId], [SubjectId])
++	SELECT TOP (75020)
++		[raw].[Id],
++		[raw].[SourceEntityId],
++		[source].[SubjectId]
++	FROM [raw].[SourceRecord] AS [raw]
++	INNER JOIN [registry].[SourceRecord] AS [source]
++		ON [source].[SourceCode] = [raw].[SourceCode]
++	   AND [source].[SourceEntityId] = [raw].[SourceEntityId]
++	   AND [source].[CurrentRawRecordId] = [raw].[Id]
++	WHERE [raw].[SourceCode] = 'RPO'
++	  AND [raw].[NormalizedAtUtc] IS NOT NULL
++	  AND [source].[SubjectId] IS NOT NULL
++	ORDER BY [raw].[Id];
++
++	;WITH [IdentifierIntervals] AS
++	(
++		SELECT
++			[backfill].[SourceEntityId],
++			[backfill].[SubjectId],
++			CONVERT(nvarchar(100), JSON_VALUE([jsonIdentifier].[value], '$.value')) COLLATE DATABASE_DEFAULT AS [IdentifierValue],
++			TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validFrom')) AS [ValidFrom],
++			TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validTo')) AS [ValidTo]
++		FROM [#BackfillRaw] AS [backfill]
++		INNER JOIN [raw].[SourceRecord] AS [raw]
++			ON [raw].[Id] = [backfill].[RawRecordId]
++		CROSS APPLY OPENJSON([raw].[JsonData], '$.identifiers') AS [jsonIdentifier]
++	),
++	[IdentifierConflicts] AS
++	(
++		SELECT
++			[SourceEntityId],
++			[SubjectId],
++			[IdentifierValue],
++			[ValidFrom]
++		FROM [IdentifierIntervals]
++		WHERE NULLIF([IdentifierValue], '') IS NOT NULL
++		GROUP BY
++			[SourceEntityId],
++			[SubjectId],
++			[IdentifierValue],
++			[ValidFrom]
++		HAVING COUNT
++		(
++			DISTINCT COALESCE(CONVERT(varchar(10), [ValidTo], 23), '<NULL>')
++		) > 1
++	),
++	[IdentifierObservations] AS
++	(
++		SELECT
++			[SourceEntityId],
++			[SubjectId],
++			CONVERT
++			(
++				nvarchar(4000),
++				CONCAT
++				(
++					N'IČO ',
++					[IdentifierValue],
++					N' has multiple ValidTo values for ValidFrom ',
++					COALESCE(CONVERT(nvarchar(10), [ValidFrom], 23), N'<NULL>'),
++					N'. All distinct source intervals were preserved.'
++				)
++			) AS [Details]
++		FROM [IdentifierConflicts]
++	)
++	INSERT INTO [registry].[DataQualityObservation]
++		([SourceCode], [SourceEntityId], [SubjectId], [RuleCode], [Severity], [Details])
++	SELECT
++		'RPO',
++		[observation].[SourceEntityId],
++		[observation].[SubjectId],
++		'RPO_IDENTIFIER_CONFLICTING_VALID_TO',
++		'Warning',
++		[observation].[Details]
++	FROM [IdentifierObservations] AS [observation]
++	WHERE NOT EXISTS
++	(
++		SELECT 1
++		FROM [registry].[DataQualityObservation] AS [existing]
++		WHERE [existing].[SourceCode] = 'RPO'
++		  AND [existing].[SourceEntityId] = [observation].[SourceEntityId]
++		  AND [existing].[SubjectId] = [observation].[SubjectId]
++		  AND [existing].[RuleCode] = 'RPO_IDENTIFIER_CONFLICTING_VALID_TO'
++		  AND [existing].[Details] = [observation].[Details]
++		  AND [existing].[ResolvedAtUtc] IS NULL
++	);
++
++	SET @InsertedIdentifierObservations = @@ROWCOUNT;
++
++	;WITH [NameIntervals] AS
++	(
++		SELECT
++			[backfill].[SourceEntityId],
++			[backfill].[SubjectId],
++			CONVERT(nvarchar(1000), JSON_VALUE([jsonName].[value], '$.value')) COLLATE DATABASE_DEFAULT AS [NameValue],
++			TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validFrom')) AS [ValidFrom],
++			TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validTo')) AS [ValidTo]
++		FROM [#BackfillRaw] AS [backfill]
++		INNER JOIN [raw].[SourceRecord] AS [raw]
++			ON [raw].[Id] = [backfill].[RawRecordId]
++		CROSS APPLY OPENJSON([raw].[JsonData], '$.fullNames') AS [jsonName]
++	),
++	[NameConflicts] AS
++	(
++		SELECT
++			[SourceEntityId],
++			[SubjectId],
++			[NameValue],
++			[ValidFrom]
++		FROM [NameIntervals]
++		WHERE NULLIF([NameValue], '') IS NOT NULL
++		GROUP BY
++			[SourceEntityId],
++			[SubjectId],
++			[NameValue],
++			[ValidFrom]
++		HAVING COUNT
++		(
++			DISTINCT COALESCE(CONVERT(varchar(10), [ValidTo], 23), '<NULL>')
++		) > 1
++	),
++	[NameObservations] AS
++	(
++		SELECT
++			[SourceEntityId],
++			[SubjectId],
++			CONVERT
++			(
++				nvarchar(4000),
++				CONCAT
++				(
++					N'Name "',
++					[NameValue],
++					N'" has multiple ValidTo values for ValidFrom ',
++					COALESCE(CONVERT(nvarchar(10), [ValidFrom], 23), N'<NULL>'),
++					N'. All distinct source intervals were preserved.'
++				)
++			) AS [Details]
++		FROM [NameConflicts]
++	)
++	INSERT INTO [registry].[DataQualityObservation]
++		([SourceCode], [SourceEntityId], [SubjectId], [RuleCode], [Severity], [Details])
++	SELECT
++		'RPO',
++		[observation].[SourceEntityId],
++		[observation].[SubjectId],
++		'RPO_NAME_CONFLICTING_VALID_TO',
++		'Warning',
++		[observation].[Details]
++	FROM [NameObservations] AS [observation]
++	WHERE NOT EXISTS
++	(
++		SELECT 1
++		FROM [registry].[DataQualityObservation] AS [existing]
++		WHERE [existing].[SourceCode] = 'RPO'
++		  AND [existing].[SourceEntityId] = [observation].[SourceEntityId]
++		  AND [existing].[SubjectId] = [observation].[SubjectId]
++		  AND [existing].[RuleCode] = 'RPO_NAME_CONFLICTING_VALID_TO'
++		  AND [existing].[Details] = [observation].[Details]
++		  AND [existing].[ResolvedAtUtc] IS NULL
++	);
++
++	SET @InsertedNameObservations = @@ROWCOUNT;
++
++	COMMIT TRANSACTION;
++
++	SELECT
++		@InsertedIdentifierObservations AS [InsertedIdentifierObservations],
++		@InsertedNameObservations AS [InsertedNameObservations];
++END TRY
++BEGIN CATCH
++	IF @@TRANCOUNT > 0
++		ROLLBACK TRANSACTION;
++
++	THROW;
++END CATCH;
+-- 
+2.51.1
+

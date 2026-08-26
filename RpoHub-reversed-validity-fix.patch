@@ -1,0 +1,160 @@
+From 9ebe916fc0ddb3df49ed6b81b1e16fb0e711837d Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 25 Aug 2026 13:06:23 -0500
+Subject: [PATCH] Preserve and flag reversed RPO validity intervals
+
+---
+ database/001_CreateFoundation.sql        |   3 +-
+ database/005_AddRpoCoreNormalization.sql | 101 ++++++++++++++++++++++-
+ 2 files changed, 100 insertions(+), 4 deletions(-)
+
+diff --git a/database/001_CreateFoundation.sql b/database/001_CreateFoundation.sql
+index aa025c7..b48dce6 100644
+--- a/database/001_CreateFoundation.sql
++++ b/database/001_CreateFoundation.sql
+@@ -113,8 +113,7 @@ CREATE TABLE [registry].[SubjectIdentifier]
+ 	[IsVerified]				bit						NOT NULL CONSTRAINT [DF_SubjectIdentifier_Verified] DEFAULT 0,
+ 	[FirstObservedAtUtc]		datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectIdentifier_First] DEFAULT SYSUTCDATETIME(),
+ 	[LastObservedAtUtc]			datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectIdentifier_Last] DEFAULT SYSUTCDATETIME(),
+-	CONSTRAINT [UQ_SubjectIdentifier_Attribution] UNIQUE ([SubjectId], [IdentifierTypeCode], [IdentifierValue], [SourceCode], [ValidFrom]),
+-	CONSTRAINT [CK_SubjectIdentifier_Validity] CHECK ([ValidTo] IS NULL OR [ValidFrom] IS NULL OR [ValidTo] >= [ValidFrom])
++	CONSTRAINT [UQ_SubjectIdentifier_Attribution] UNIQUE ([SubjectId], [IdentifierTypeCode], [IdentifierValue], [SourceCode], [ValidFrom])
+ );
+ CREATE INDEX [IX_SubjectIdentifier_Lookup] ON [registry].[SubjectIdentifier] ([IdentifierTypeCode], [IdentifierValue]) INCLUDE ([SubjectId], [SourceCode], [IsVerified]);
+ 
+diff --git a/database/005_AddRpoCoreNormalization.sql b/database/005_AddRpoCoreNormalization.sql
+index 2188736..7459782 100644
+--- a/database/005_AddRpoCoreNormalization.sql
++++ b/database/005_AddRpoCoreNormalization.sql
+@@ -15,8 +15,7 @@ BEGIN TRY
+ 			[ValidTo]				date					NULL,
+ 			[FirstObservedAtUtc]		datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectName_First] DEFAULT SYSUTCDATETIME(),
+ 			[LastObservedAtUtc]		datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectName_Last] DEFAULT SYSUTCDATETIME(),
+-			[NameHash] AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), [NameValue]))) PERSISTED,
+-			CONSTRAINT [CK_SubjectName_Validity] CHECK ([ValidTo] IS NULL OR [ValidFrom] IS NULL OR [ValidTo] >= [ValidFrom])
++			[NameHash] AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), [NameValue]))) PERSISTED
+ 		);
+ 
+ 		CREATE UNIQUE INDEX [UX_SubjectName_Attribution]
+@@ -27,6 +26,30 @@ BEGIN TRY
+ 			INCLUDE ([NameValue], [SourceCode]);
+ 	END;
+ 
++	IF EXISTS
++	(
++		SELECT 1
++		FROM [sys].[check_constraints]
++		WHERE [parent_object_id] = OBJECT_ID(N'[registry].[SubjectIdentifier]')
++		  AND [name] = N'CK_SubjectIdentifier_Validity'
++	)
++	BEGIN
++		ALTER TABLE [registry].[SubjectIdentifier]
++		DROP CONSTRAINT [CK_SubjectIdentifier_Validity];
++	END;
++
++	IF EXISTS
++	(
++		SELECT 1
++		FROM [sys].[check_constraints]
++		WHERE [parent_object_id] = OBJECT_ID(N'[registry].[SubjectName]')
++		  AND [name] = N'CK_SubjectName_Validity'
++	)
++	BEGIN
++		ALTER TABLE [registry].[SubjectName]
++		DROP CONSTRAINT [CK_SubjectName_Validity];
++	END;
++
+ 	COMMIT TRANSACTION;
+ END TRY
+ BEGIN CATCH
+@@ -231,6 +254,43 @@ BEGIN
+ 
+ 		SET @InsertedIdentifiers = @@ROWCOUNT;
+ 
++		INSERT INTO [registry].[DataQualityObservation]
++			([SourceCode], [SourceEntityId], [SubjectId], [RuleCode], [Severity], [Details])
++		SELECT
++			'RPO',
++			[pending].[SourceEntityId],
++			[mapped].[SubjectId],
++			'RPO_IDENTIFIER_REVERSED_VALIDITY',
++			'Warning',
++			CONVERT
++			(
++				nvarchar(4000),
++				CONCAT
++				(
++					N'IČO ',
++					[identifier].[IdentifierValue],
++					N' has ValidFrom ',
++					CONVERT(nvarchar(10), [identifier].[ValidFrom], 23),
++					N' after ValidTo ',
++					CONVERT(nvarchar(10), [identifier].[ValidTo], 23),
++					N'. Source values were preserved.'
++				)
++			)
++		FROM [#Pending] AS [pending]
++		INNER JOIN [#SubjectMap] AS [mapped]
++			ON [mapped].[RawRecordId] = [pending].[RawRecordId]
++		CROSS APPLY OPENJSON([pending].[JsonData], '$.identifiers') AS [jsonIdentifier]
++		CROSS APPLY
++		(
++			SELECT
++				CONVERT(nvarchar(100), JSON_VALUE([jsonIdentifier].[value], '$.value')) COLLATE DATABASE_DEFAULT AS [IdentifierValue],
++				TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validFrom')) AS [ValidFrom],
++				TRY_CONVERT(date, JSON_VALUE([jsonIdentifier].[value], '$.validTo')) AS [ValidTo]
++		) AS [identifier]
++		WHERE [identifier].[ValidFrom] IS NOT NULL
++		  AND [identifier].[ValidTo] IS NOT NULL
++		  AND [identifier].[ValidTo] < [identifier].[ValidFrom];
++
+ 		INSERT INTO [registry].[SubjectIdentifier]
+ 			([SubjectId], [IdentifierTypeCode], [IdentifierValue], [SourceCode], [ValidFrom], [ValidTo], [IsVerified])
+ 		SELECT DISTINCT
+@@ -270,6 +330,43 @@ BEGIN
+ 
+ 		SET @InsertedIdentifiers += @@ROWCOUNT;
+ 
++		INSERT INTO [registry].[DataQualityObservation]
++			([SourceCode], [SourceEntityId], [SubjectId], [RuleCode], [Severity], [Details])
++		SELECT
++			'RPO',
++			[pending].[SourceEntityId],
++			[mapped].[SubjectId],
++			'RPO_NAME_REVERSED_VALIDITY',
++			'Warning',
++			CONVERT
++			(
++				nvarchar(4000),
++				CONCAT
++				(
++					N'Name "',
++					[name].[NameValue],
++					N'" has ValidFrom ',
++					CONVERT(nvarchar(10), [name].[ValidFrom], 23),
++					N' after ValidTo ',
++					CONVERT(nvarchar(10), [name].[ValidTo], 23),
++					N'. Source values were preserved.'
++				)
++			)
++		FROM [#Pending] AS [pending]
++		INNER JOIN [#SubjectMap] AS [mapped]
++			ON [mapped].[RawRecordId] = [pending].[RawRecordId]
++		CROSS APPLY OPENJSON([pending].[JsonData], '$.fullNames') AS [jsonName]
++		CROSS APPLY
++		(
++			SELECT
++				CONVERT(nvarchar(1000), JSON_VALUE([jsonName].[value], '$.value')) COLLATE DATABASE_DEFAULT AS [NameValue],
++				TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validFrom')) AS [ValidFrom],
++				TRY_CONVERT(date, JSON_VALUE([jsonName].[value], '$.validTo')) AS [ValidTo]
++		) AS [name]
++		WHERE [name].[ValidFrom] IS NOT NULL
++		  AND [name].[ValidTo] IS NOT NULL
++		  AND [name].[ValidTo] < [name].[ValidFrom];
++
+ 		INSERT INTO [registry].[SubjectName]
+ 			([SubjectId], [NameValue], [SourceCode], [ValidFrom], [ValidTo])
+ 		SELECT DISTINCT
+-- 
+2.51.1
+
