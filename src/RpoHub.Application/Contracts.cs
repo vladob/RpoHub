@@ -35,6 +35,12 @@ public sealed record RpoNormalizationBatchResult(
     int InsertedIdentifiers,
     int InsertedNames,
     bool LockUnavailable);
+public sealed record RpoLegalLifecycleBatchResult(
+    int NormalizedRecords,
+    int UpsertedLifecycleRecords,
+    int InsertedLegalForms,
+    int QualityObservations,
+    bool LockUnavailable);
 
 public interface IRpoApiClient
 {
@@ -70,6 +76,11 @@ public interface IInitializationFileImporter
 public interface IRpoCoreNormalizer
 {
     Task<RpoNormalizationBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken);
+}
+
+public interface IRpoLegalLifecycleNormalizer
+{
+    Task<RpoLegalLifecycleBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken);
 }
 
 public sealed class DiscoverRpoUpdates(IRpoExportCatalog catalog, IImportStateStore stateStore)

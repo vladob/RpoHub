@@ -20,6 +20,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IImportStateStore>(_ => new SqlImportStateStore(connectionString));
         services.AddSingleton<IRawRecordStore>(_ => new SqlRawRecordStore(connectionString));
         services.AddSingleton<IRpoCoreNormalizer>(_ => new SqlRpoCoreNormalizer(connectionString));
+        services.AddSingleton<IRpoLegalLifecycleNormalizer>(_ => new SqlRpoLegalLifecycleNormalizer(connectionString));
         services.AddTransient<DiscoverRpoUpdates>();
         services.AddTransient<GetRpoInitializationPreview>();
         services.AddTransient<StartRpoInitialization>();

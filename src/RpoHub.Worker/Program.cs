@@ -6,4 +6,5 @@ builder.Services.AddRpoHubInfrastructure(builder.Configuration);
 builder.Services.AddHostedService<UpdateDiscoveryWorker>();
 builder.Services.AddHostedService<InitializationImportWorker>();
 builder.Services.AddHostedService<RpoNormalizationWorker>();
+builder.Services.AddHostedService<RpoLegalLifecycleNormalizationWorker>();
 await builder.Build().RunAsync();

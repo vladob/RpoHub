@@ -27,6 +27,8 @@ After running `database/005_AddRpoCoreNormalization.sql`, the Worker normalizes 
 
 `database/006_BackfillInitialConflictObservations.sql` idempotently backfills conflicting-`ValidTo` data-quality observations for the first 75,020 records that were normalized before those rules were deployed during development.
 
+After running `database/007_AddLegalFormAndLifecycleNormalization.sql`, a second Worker normalization slice records source-attributed establishment and termination dates in `registry.SubjectLifecycle`, preserves legal-form history in `registry.SubjectLegalForm`, and reports malformed lifecycle dates or reversed lifecycle and legal-form dates without changing the raw source values.
+
 ## First run
 
 1. Install the .NET 8 SDK and SQL Server.

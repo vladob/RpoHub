@@ -180,3 +180,27 @@ public sealed class SqlRpoCoreNormalizer(string connectionString) : IRpoCoreNorm
             reader.GetBoolean(4));
     }
 }
+
+public sealed class SqlRpoLegalLifecycleNormalizer(string connectionString) : IRpoLegalLifecycleNormalizer
+{
+    public async Task<RpoLegalLifecycleBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new SqlCommand("[etl].[NormalizeRpoLegalLifecycleBatch]", connection)
+        {
+            CommandType = System.Data.CommandType.StoredProcedure,
+            CommandTimeout = 300
+        };
+        command.Parameters.Add("@BatchSize", System.Data.SqlDbType.Int).Value = batchSize;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+        return new RpoLegalLifecycleBatchResult(
+            reader.GetInt32(0),
+            reader.GetInt32(1),
+            reader.GetInt32(2),
+            reader.GetInt32(3),
+            reader.GetBoolean(4));
+    }
+}
