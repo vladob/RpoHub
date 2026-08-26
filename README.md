@@ -25,6 +25,8 @@ The Worker automatically resumes a `Started` initialization batch, importing one
 
 After running `database/005_AddRpoCoreNormalization.sql`, the Worker normalizes the completed initialization snapshot in bounded, restartable batches. The first normalization slice creates one subject per RPO source entity, records the source entity ID and all IČO validity periods, preserves every historical name in `registry.SubjectName`, and selects the current or latest name for `registry.Subject.DisplayName`. Registry changes and `raw.SourceRecord.NormalizedAtUtc` are committed atomically for each batch.
 
+`database/006_BackfillInitialConflictObservations.sql` idempotently backfills conflicting-`ValidTo` data-quality observations for the first 75,020 records that were normalized before those rules were deployed during development.
+
 ## First run
 
 1. Install the .NET 8 SDK and SQL Server.
