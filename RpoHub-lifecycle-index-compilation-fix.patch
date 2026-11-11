@@ -1,0 +1,34 @@
+From 5e0738e277cb1a550c4675df81501227b48333e0 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 26 Aug 2026 14:27:25 +0530
+Subject: [PATCH] Defer lifecycle pending index compilation
+
+---
+ .../007_AddLegalFormAndLifecycleNormalization.sql     | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/database/007_AddLegalFormAndLifecycleNormalization.sql b/database/007_AddLegalFormAndLifecycleNormalization.sql
+index 2fe703d..d1c90c3 100644
+--- a/database/007_AddLegalFormAndLifecycleNormalization.sql
++++ b/database/007_AddLegalFormAndLifecycleNormalization.sql
+@@ -17,10 +17,13 @@ BEGIN TRY
+ 		  AND [name] = N'IX_RawSourceRecord_LegalLifecyclePending'
+ 	)
+ 	BEGIN
+-		CREATE INDEX [IX_RawSourceRecord_LegalLifecyclePending]
+-			ON [raw].[SourceRecord] ([SourceCode], [Id])
+-			INCLUDE ([SourceEntityId], [NormalizedAtUtc], [LegalLifecycleNormalizedAtUtc])
+-			WHERE [LegalLifecycleNormalizedAtUtc] IS NULL;
++		EXEC
++		(
++			N'CREATE INDEX [IX_RawSourceRecord_LegalLifecyclePending]
++			  ON [raw].[SourceRecord] ([SourceCode], [Id])
++			  INCLUDE ([SourceEntityId], [NormalizedAtUtc], [LegalLifecycleNormalizedAtUtc])
++			  WHERE [LegalLifecycleNormalizedAtUtc] IS NULL;'
++		);
+ 	END;
+ 
+ 	IF OBJECT_ID(N'[registry].[SubjectLifecycle]', N'U') IS NULL
+-- 
+2.51.1
+

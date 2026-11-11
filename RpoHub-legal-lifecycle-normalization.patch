@@ -1,0 +1,554 @@
+From 8914cd1a7ecf9a743c0d525a6def5fef2ba2f565 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 26 Aug 2026 14:21:54 +0530
+Subject: [PATCH] Add RPO legal form and lifecycle normalization
+
+---
+ README.md                                     |   2 +
+ ..._AddLegalFormAndLifecycleNormalization.sql | 374 ++++++++++++++++++
+ src/RpoHub.Application/Contracts.cs           |  11 +
+ .../ServiceCollectionExtensions.cs            |   1 +
+ src/RpoHub.Infrastructure/SqlStores.cs        |  24 ++
+ src/RpoHub.Worker/Program.cs                  |   1 +
+ .../RpoLegalLifecycleNormalizationWorker.cs   |  52 +++
+ 7 files changed, 465 insertions(+)
+ create mode 100644 database/007_AddLegalFormAndLifecycleNormalization.sql
+ create mode 100644 src/RpoHub.Worker/RpoLegalLifecycleNormalizationWorker.cs
+
+diff --git a/README.md b/README.md
+index 63ed5c1..758bd59 100644
+--- a/README.md
++++ b/README.md
+@@ -27,6 +27,8 @@ After running `database/005_AddRpoCoreNormalization.sql`, the Worker normalizes
+ 
+ `database/006_BackfillInitialConflictObservations.sql` idempotently backfills conflicting-`ValidTo` data-quality observations for the first 75,020 records that were normalized before those rules were deployed during development.
+ 
++After running `database/007_AddLegalFormAndLifecycleNormalization.sql`, a second Worker normalization slice records source-attributed establishment and termination dates in `registry.SubjectLifecycle`, preserves legal-form history in `registry.SubjectLegalForm`, and reports malformed lifecycle dates or reversed lifecycle and legal-form dates without changing the raw source values.
++
+ ## First run
+ 
+ 1. Install the .NET 8 SDK and SQL Server.
+diff --git a/database/007_AddLegalFormAndLifecycleNormalization.sql b/database/007_AddLegalFormAndLifecycleNormalization.sql
+new file mode 100644
+index 0000000..2fe703d
+--- /dev/null
++++ b/database/007_AddLegalFormAndLifecycleNormalization.sql
+@@ -0,0 +1,374 @@
++SET XACT_ABORT ON;
++
++BEGIN TRY
++	BEGIN TRANSACTION;
++
++	IF COL_LENGTH(N'raw.SourceRecord', N'LegalLifecycleNormalizedAtUtc') IS NULL
++	BEGIN
++		ALTER TABLE [raw].[SourceRecord]
++		ADD [LegalLifecycleNormalizedAtUtc] datetime2(3) NULL;
++	END;
++
++	IF NOT EXISTS
++	(
++		SELECT 1
++		FROM [sys].[indexes]
++		WHERE [object_id] = OBJECT_ID(N'[raw].[SourceRecord]')
++		  AND [name] = N'IX_RawSourceRecord_LegalLifecyclePending'
++	)
++	BEGIN
++		CREATE INDEX [IX_RawSourceRecord_LegalLifecyclePending]
++			ON [raw].[SourceRecord] ([SourceCode], [Id])
++			INCLUDE ([SourceEntityId], [NormalizedAtUtc], [LegalLifecycleNormalizedAtUtc])
++			WHERE [LegalLifecycleNormalizedAtUtc] IS NULL;
++	END;
++
++	IF OBJECT_ID(N'[registry].[SubjectLifecycle]', N'U') IS NULL
++	BEGIN
++		CREATE TABLE [registry].[SubjectLifecycle]
++		(
++			[SubjectId]					uniqueidentifier	NOT NULL CONSTRAINT [FK_SubjectLifecycle_Subject] REFERENCES [registry].[Subject] ([Id]),
++			[SourceCode]					varchar(30)			NOT NULL,
++			[EstablishedOn]				date				NULL,
++			[TerminatedOn]				date				NULL,
++			[ContainsSourceInconsistency]	bit				NULL,
++			[FirstObservedAtUtc]			datetime2(3)		NOT NULL CONSTRAINT [DF_SubjectLifecycle_First] DEFAULT SYSUTCDATETIME(),
++			[LastObservedAtUtc]			datetime2(3)		NOT NULL CONSTRAINT [DF_SubjectLifecycle_Last] DEFAULT SYSUTCDATETIME(),
++			CONSTRAINT [PK_SubjectLifecycle] PRIMARY KEY ([SubjectId], [SourceCode])
++		);
++
++		CREATE INDEX [IX_SubjectLifecycle_Status]
++			ON [registry].[SubjectLifecycle] ([SourceCode], [TerminatedOn], [EstablishedOn])
++			INCLUDE ([SubjectId], [ContainsSourceInconsistency]);
++	END;
++
++	IF OBJECT_ID(N'[registry].[SubjectLegalForm]', N'U') IS NULL
++	BEGIN
++		CREATE TABLE [registry].[SubjectLegalForm]
++		(
++			[Id]					bigint IDENTITY(1,1)	NOT NULL CONSTRAINT [PK_SubjectLegalForm] PRIMARY KEY,
++			[SubjectId]			uniqueidentifier		NOT NULL CONSTRAINT [FK_SubjectLegalForm_Subject] REFERENCES [registry].[Subject] ([Id]),
++			[LegalFormCode]		varchar(50)				NULL,
++			[LegalFormName]		nvarchar(500)			NULL,
++			[CodelistCode]		varchar(100)			NULL,
++			[SourceCode]			varchar(30)				NOT NULL,
++			[ValidFrom]			date					NULL,
++			[ValidTo]			date					NULL,
++			[AttributionHash]	binary(32)				NOT NULL,
++			[FirstObservedAtUtc]	datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectLegalForm_First] DEFAULT SYSUTCDATETIME(),
++			[LastObservedAtUtc]	datetime2(3)			NOT NULL CONSTRAINT [DF_SubjectLegalForm_Last] DEFAULT SYSUTCDATETIME()
++		);
++
++		CREATE UNIQUE INDEX [UX_SubjectLegalForm_Attribution]
++			ON [registry].[SubjectLegalForm]
++				([SubjectId], [SourceCode], [AttributionHash], [ValidFrom], [ValidTo]);
++
++		CREATE INDEX [IX_SubjectLegalForm_Current]
++			ON [registry].[SubjectLegalForm]
++				([SourceCode], [LegalFormCode], [ValidTo], [ValidFrom])
++			INCLUDE ([SubjectId], [LegalFormName], [CodelistCode]);
++	END;
++
++	COMMIT TRANSACTION;
++END TRY
++BEGIN CATCH
++	IF @@TRANCOUNT > 0
++		ROLLBACK TRANSACTION;
++
++	THROW;
++END CATCH;
++GO
++
++CREATE OR ALTER PROCEDURE [etl].[NormalizeRpoLegalLifecycleBatch]
++	@BatchSize int = 5000
++AS
++BEGIN
++	SET NOCOUNT ON;
++	SET XACT_ABORT ON;
++
++	IF @BatchSize < 1 OR @BatchSize > 20000
++		THROW 51007, 'Batch size must be between 1 and 20000.', 1;
++
++	DECLARE @NormalizedRecords int = 0;
++	DECLARE @UpsertedLifecycleRecords int = 0;
++	DECLARE @InsertedLegalForms int = 0;
++	DECLARE @QualityObservations int = 0;
++
++	BEGIN TRY
++		BEGIN TRANSACTION;
++
++		DECLARE @LockResult int;
++		EXEC @LockResult = [sys].[sp_getapplock]
++			@Resource = N'RpoHub:RPO:LegalLifecycleNormalization',
++			@LockMode = N'Exclusive',
++			@LockOwner = N'Transaction',
++			@LockTimeout = 0;
++
++		IF @LockResult < 0
++		BEGIN
++			ROLLBACK TRANSACTION;
++			SELECT
++				CAST(0 AS int) AS [NormalizedRecords],
++				CAST(0 AS int) AS [UpsertedLifecycleRecords],
++				CAST(0 AS int) AS [InsertedLegalForms],
++				CAST(0 AS int) AS [QualityObservations],
++				CAST(1 AS bit) AS [LockUnavailable];
++			RETURN;
++		END;
++
++		CREATE TABLE [#Pending]
++		(
++			[RawRecordId]		bigint			NOT NULL CONSTRAINT [PK_LegalLifecyclePending] PRIMARY KEY,
++			[SourceEntityId]	varchar(100) COLLATE DATABASE_DEFAULT NOT NULL,
++			[SubjectId]			uniqueidentifier NOT NULL,
++			[JsonData]			varchar(max) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
++			[EstablishedRaw]	varchar(30) COLLATE DATABASE_DEFAULT NULL,
++			[TerminatedRaw]	varchar(30) COLLATE DATABASE_DEFAULT NULL,
++			[EstablishedOn]		date			NULL,
++			[TerminatedOn]		date			NULL,
++			[ContainsInconsistency]	bit		NULL
++		);
++
++		INSERT INTO [#Pending]
++			([RawRecordId], [SourceEntityId], [SubjectId], [JsonData], [EstablishedRaw], [TerminatedRaw], [EstablishedOn], [TerminatedOn], [ContainsInconsistency])
++		SELECT TOP (@BatchSize)
++			[raw].[Id],
++			[raw].[SourceEntityId],
++			[source].[SubjectId],
++			[raw].[JsonData],
++			JSON_VALUE([raw].[JsonData], '$.establishment') COLLATE DATABASE_DEFAULT,
++			JSON_VALUE([raw].[JsonData], '$.termination') COLLATE DATABASE_DEFAULT,
++			TRY_CONVERT(date, JSON_VALUE([raw].[JsonData], '$.establishment')),
++			TRY_CONVERT(date, JSON_VALUE([raw].[JsonData], '$.termination')),
++			CASE JSON_VALUE([raw].[JsonData], '$.containsInconsistency')
++				WHEN 'true' THEN CAST(1 AS bit)
++				WHEN 'false' THEN CAST(0 AS bit)
++				ELSE NULL
++			END
++		FROM [raw].[SourceRecord] AS [raw] WITH (UPDLOCK, READPAST, ROWLOCK)
++		INNER JOIN [registry].[SourceRecord] AS [source]
++			ON [source].[SourceCode] = [raw].[SourceCode]
++		   AND [source].[SourceEntityId] = [raw].[SourceEntityId]
++		   AND [source].[CurrentRawRecordId] = [raw].[Id]
++		WHERE [raw].[SourceCode] = 'RPO'
++		  AND [raw].[NormalizedAtUtc] IS NOT NULL
++		  AND [raw].[LegalLifecycleNormalizedAtUtc] IS NULL
++		  AND [source].[SubjectId] IS NOT NULL
++		ORDER BY [raw].[Id];
++
++		IF NOT EXISTS (SELECT 1 FROM [#Pending])
++		BEGIN
++			COMMIT TRANSACTION;
++			SELECT
++				CAST(0 AS int) AS [NormalizedRecords],
++				CAST(0 AS int) AS [UpsertedLifecycleRecords],
++				CAST(0 AS int) AS [InsertedLegalForms],
++				CAST(0 AS int) AS [QualityObservations],
++				CAST(0 AS bit) AS [LockUnavailable];
++			RETURN;
++		END;
++
++		MERGE [registry].[SubjectLifecycle] WITH (HOLDLOCK) AS [target]
++		USING [#Pending] AS [source]
++		   ON [target].[SubjectId] = [source].[SubjectId]
++		  AND [target].[SourceCode] = 'RPO'
++		WHEN MATCHED THEN
++			UPDATE SET
++				[EstablishedOn] = [source].[EstablishedOn],
++				[TerminatedOn] = [source].[TerminatedOn],
++				[ContainsSourceInconsistency] = [source].[ContainsInconsistency],
++				[LastObservedAtUtc] = SYSUTCDATETIME()
++		WHEN NOT MATCHED THEN
++			INSERT
++				([SubjectId], [SourceCode], [EstablishedOn], [TerminatedOn], [ContainsSourceInconsistency])
++			VALUES
++				([source].[SubjectId], 'RPO', [source].[EstablishedOn], [source].[TerminatedOn], [source].[ContainsInconsistency]);
++
++		SET @UpsertedLifecycleRecords = @@ROWCOUNT;
++
++		INSERT INTO [registry].[DataQualityObservation]
++			([SourceCode], [SourceEntityId], [SubjectId], [RuleCode], [Severity], [Details])
++		SELECT
++			'RPO',
++			[pending].[SourceEntityId],
++			[pending].[SubjectId],
++			'RPO_LIFECYCLE_REVERSED_DATES',
++			'Warning',
++			CONVERT
++			(
++				nvarchar(4000),
++				CONCAT
++				(
++					N'Establishment ',
++					CONVERT(nvarchar(10), [pending].[EstablishedOn], 23),
++					N' is after termination ',
++					CONVERT(nvarchar(10), [pending].[TerminatedOn], 23),
++					N'. Source values were preserved.'
++				)
++			)
++		FROM [#Pending] AS [pending]
++		WHERE [pending].[EstablishedOn] IS NOT NULL
++		  AND [pending].[TerminatedOn] IS NOT NULL
++		  AND [pending].[TerminatedOn] < [pending].[EstablishedOn];
++
++		SET @QualityObservations += @@ROWCOUNT;
++
++		INSERT INTO [registry].[DataQualityObservation]
++			([SourceCode], [SourceEntityId], [SubjectId], [RuleCode], [Severity], [Details])
++		SELECT
++			'RPO',
++			[pending].[SourceEntityId],
++			[pending].[SubjectId],
++			'RPO_LIFECYCLE_INVALID_DATE',
++			'Warning',
++			CONVERT
++			(
++				nvarchar(4000),
++				CONCAT
++				(
++					N'Invalid lifecycle date value: establishment=',
++					COALESCE(CONVERT(nvarchar(30), [pending].[EstablishedRaw]), N'<NULL>'),
++					N', termination=',
++					COALESCE(CONVERT(nvarchar(30), [pending].[TerminatedRaw]), N'<NULL>'),
++					N'. Raw values remain available in raw.SourceRecord.'
++				)
++			)
++		FROM [#Pending] AS [pending]
++		WHERE
++			([pending].[EstablishedRaw] IS NOT NULL AND [pending].[EstablishedOn] IS NULL)
++			OR
++			([pending].[TerminatedRaw] IS NOT NULL AND [pending].[TerminatedOn] IS NULL);
++
++		SET @QualityObservations += @@ROWCOUNT;
++
++		INSERT INTO [registry].[DataQualityObservation]
++			([SourceCode], [SourceEntityId], [SubjectId], [RuleCode], [Severity], [Details])
++		SELECT DISTINCT
++			'RPO',
++			[pending].[SourceEntityId],
++			[pending].[SubjectId],
++			'RPO_LEGAL_FORM_REVERSED_VALIDITY',
++			'Warning',
++			CONVERT
++			(
++				nvarchar(4000),
++				CONCAT
++				(
++					N'Legal form ',
++					COALESCE([legalForm].[LegalFormCode], N'<NULL>'),
++					N' has ValidFrom ',
++					CONVERT(nvarchar(10), [legalForm].[ValidFrom], 23),
++					N' after ValidTo ',
++					CONVERT(nvarchar(10), [legalForm].[ValidTo], 23),
++					N'. Source values were preserved.'
++				)
++			)
++		FROM [#Pending] AS [pending]
++		CROSS APPLY OPENJSON([pending].[JsonData], '$.legalForms') AS [jsonLegalForm]
++		CROSS APPLY
++		(
++			SELECT
++				CONVERT(nvarchar(50), JSON_VALUE([jsonLegalForm].[value], '$.value.code')) COLLATE DATABASE_DEFAULT AS [LegalFormCode],
++				TRY_CONVERT(date, JSON_VALUE([jsonLegalForm].[value], '$.validFrom')) AS [ValidFrom],
++				TRY_CONVERT(date, JSON_VALUE([jsonLegalForm].[value], '$.validTo')) AS [ValidTo]
++		) AS [legalForm]
++		WHERE [legalForm].[ValidFrom] IS NOT NULL
++		  AND [legalForm].[ValidTo] IS NOT NULL
++		  AND [legalForm].[ValidTo] < [legalForm].[ValidFrom];
++
++		SET @QualityObservations += @@ROWCOUNT;
++
++		INSERT INTO [registry].[SubjectLegalForm]
++			([SubjectId], [LegalFormCode], [LegalFormName], [CodelistCode], [SourceCode], [ValidFrom], [ValidTo], [AttributionHash])
++		SELECT DISTINCT
++			[pending].[SubjectId],
++			[legalForm].[LegalFormCode],
++			[legalForm].[LegalFormName],
++			[legalForm].[CodelistCode],
++			'RPO',
++			[legalForm].[ValidFrom],
++			[legalForm].[ValidTo],
++			[legalForm].[AttributionHash]
++		FROM [#Pending] AS [pending]
++		CROSS APPLY OPENJSON([pending].[JsonData], '$.legalForms') AS [jsonLegalForm]
++		CROSS APPLY
++		(
++			SELECT
++				CONVERT(varchar(50), JSON_VALUE([jsonLegalForm].[value], '$.value.code')) COLLATE DATABASE_DEFAULT AS [LegalFormCode],
++				CONVERT(nvarchar(500), JSON_VALUE([jsonLegalForm].[value], '$.value.value')) COLLATE DATABASE_DEFAULT AS [LegalFormName],
++				CONVERT(varchar(100), JSON_VALUE([jsonLegalForm].[value], '$.value.codelistCode')) COLLATE DATABASE_DEFAULT AS [CodelistCode],
++				TRY_CONVERT(date, JSON_VALUE([jsonLegalForm].[value], '$.validFrom')) AS [ValidFrom],
++				TRY_CONVERT(date, JSON_VALUE([jsonLegalForm].[value], '$.validTo')) AS [ValidTo],
++				CONVERT
++				(
++					binary(32),
++					HASHBYTES
++					(
++						'SHA2_256',
++						CONVERT
++						(
++							varbinary(max),
++							CONCAT
++							(
++								COALESCE(CONVERT(nvarchar(50), JSON_VALUE([jsonLegalForm].[value], '$.value.code')), N'<NULL>'),
++								NCHAR(31),
++								COALESCE(CONVERT(nvarchar(500), JSON_VALUE([jsonLegalForm].[value], '$.value.value')), N'<NULL>'),
++								NCHAR(31),
++								COALESCE(CONVERT(nvarchar(100), JSON_VALUE([jsonLegalForm].[value], '$.value.codelistCode')), N'<NULL>')
++							)
++						)
++					)
++				) AS [AttributionHash]
++		) AS [legalForm]
++		WHERE
++		  (
++			[legalForm].[LegalFormCode] IS NOT NULL
++			OR [legalForm].[LegalFormName] IS NOT NULL
++			OR [legalForm].[CodelistCode] IS NOT NULL
++		  )
++		  AND NOT EXISTS
++		(
++			SELECT 1
++			FROM [registry].[SubjectLegalForm] AS [existing]
++			WHERE [existing].[SubjectId] = [pending].[SubjectId]
++			  AND [existing].[SourceCode] = 'RPO'
++			  AND [existing].[AttributionHash] = [legalForm].[AttributionHash]
++			  AND
++			  (
++				[existing].[ValidFrom] = [legalForm].[ValidFrom]
++				OR ([existing].[ValidFrom] IS NULL AND [legalForm].[ValidFrom] IS NULL)
++			  )
++			  AND
++			  (
++				[existing].[ValidTo] = [legalForm].[ValidTo]
++				OR ([existing].[ValidTo] IS NULL AND [legalForm].[ValidTo] IS NULL)
++			  )
++		);
++
++		SET @InsertedLegalForms = @@ROWCOUNT;
++
++		UPDATE [raw]
++		SET [LegalLifecycleNormalizedAtUtc] = SYSUTCDATETIME()
++		FROM [raw].[SourceRecord] AS [raw]
++		INNER JOIN [#Pending] AS [pending]
++			ON [pending].[RawRecordId] = [raw].[Id];
++
++		SET @NormalizedRecords = @@ROWCOUNT;
++
++		COMMIT TRANSACTION;
++
++		SELECT
++			@NormalizedRecords AS [NormalizedRecords],
++			@UpsertedLifecycleRecords AS [UpsertedLifecycleRecords],
++			@InsertedLegalForms AS [InsertedLegalForms],
++			@QualityObservations AS [QualityObservations],
++			CAST(0 AS bit) AS [LockUnavailable];
++	END TRY
++	BEGIN CATCH
++		IF @@TRANCOUNT > 0
++			ROLLBACK TRANSACTION;
++
++		THROW;
++	END CATCH;
++END;
++GO
+diff --git a/src/RpoHub.Application/Contracts.cs b/src/RpoHub.Application/Contracts.cs
+index 5b3ba47..318a67e 100644
+--- a/src/RpoHub.Application/Contracts.cs
++++ b/src/RpoHub.Application/Contracts.cs
+@@ -35,6 +35,12 @@ public sealed record RpoNormalizationBatchResult(
+     int InsertedIdentifiers,
+     int InsertedNames,
+     bool LockUnavailable);
++public sealed record RpoLegalLifecycleBatchResult(
++    int NormalizedRecords,
++    int UpsertedLifecycleRecords,
++    int InsertedLegalForms,
++    int QualityObservations,
++    bool LockUnavailable);
+ 
+ public interface IRpoApiClient
+ {
+@@ -72,6 +78,11 @@ public interface IRpoCoreNormalizer
+     Task<RpoNormalizationBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken);
+ }
+ 
++public interface IRpoLegalLifecycleNormalizer
++{
++    Task<RpoLegalLifecycleBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken);
++}
++
+ public sealed class DiscoverRpoUpdates(IRpoExportCatalog catalog, IImportStateStore stateStore)
+ {
+     public async Task<int> ExecuteAsync(CancellationToken cancellationToken)
+diff --git a/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs b/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
+index fe249e4..470323a 100644
+--- a/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
++++ b/src/RpoHub.Infrastructure/ServiceCollectionExtensions.cs
+@@ -20,6 +20,7 @@ public static class ServiceCollectionExtensions
+         services.AddSingleton<IImportStateStore>(_ => new SqlImportStateStore(connectionString));
+         services.AddSingleton<IRawRecordStore>(_ => new SqlRawRecordStore(connectionString));
+         services.AddSingleton<IRpoCoreNormalizer>(_ => new SqlRpoCoreNormalizer(connectionString));
++        services.AddSingleton<IRpoLegalLifecycleNormalizer>(_ => new SqlRpoLegalLifecycleNormalizer(connectionString));
+         services.AddTransient<DiscoverRpoUpdates>();
+         services.AddTransient<GetRpoInitializationPreview>();
+         services.AddTransient<StartRpoInitialization>();
+diff --git a/src/RpoHub.Infrastructure/SqlStores.cs b/src/RpoHub.Infrastructure/SqlStores.cs
+index 493a262..9d573b5 100644
+--- a/src/RpoHub.Infrastructure/SqlStores.cs
++++ b/src/RpoHub.Infrastructure/SqlStores.cs
+@@ -180,3 +180,27 @@ public sealed class SqlRpoCoreNormalizer(string connectionString) : IRpoCoreNorm
+             reader.GetBoolean(4));
+     }
+ }
++
++public sealed class SqlRpoLegalLifecycleNormalizer(string connectionString) : IRpoLegalLifecycleNormalizer
++{
++    public async Task<RpoLegalLifecycleBatchResult> NormalizeNextBatchAsync(int batchSize, CancellationToken cancellationToken)
++    {
++        await using var connection = new SqlConnection(connectionString);
++        await connection.OpenAsync(cancellationToken);
++        await using var command = new SqlCommand("[etl].[NormalizeRpoLegalLifecycleBatch]", connection)
++        {
++            CommandType = System.Data.CommandType.StoredProcedure,
++            CommandTimeout = 300
++        };
++        command.Parameters.Add("@BatchSize", System.Data.SqlDbType.Int).Value = batchSize;
++
++        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
++        await reader.ReadAsync(cancellationToken);
++        return new RpoLegalLifecycleBatchResult(
++            reader.GetInt32(0),
++            reader.GetInt32(1),
++            reader.GetInt32(2),
++            reader.GetInt32(3),
++            reader.GetBoolean(4));
++    }
++}
+diff --git a/src/RpoHub.Worker/Program.cs b/src/RpoHub.Worker/Program.cs
+index 69e7151..e7f0b85 100644
+--- a/src/RpoHub.Worker/Program.cs
++++ b/src/RpoHub.Worker/Program.cs
+@@ -6,4 +6,5 @@ builder.Services.AddRpoHubInfrastructure(builder.Configuration);
+ builder.Services.AddHostedService<UpdateDiscoveryWorker>();
+ builder.Services.AddHostedService<InitializationImportWorker>();
+ builder.Services.AddHostedService<RpoNormalizationWorker>();
++builder.Services.AddHostedService<RpoLegalLifecycleNormalizationWorker>();
+ await builder.Build().RunAsync();
+diff --git a/src/RpoHub.Worker/RpoLegalLifecycleNormalizationWorker.cs b/src/RpoHub.Worker/RpoLegalLifecycleNormalizationWorker.cs
+new file mode 100644
+index 0000000..ba7fbd0
+--- /dev/null
++++ b/src/RpoHub.Worker/RpoLegalLifecycleNormalizationWorker.cs
+@@ -0,0 +1,52 @@
++using Microsoft.Extensions.Options;
++using RpoHub.Application;
++using RpoHub.Infrastructure;
++
++namespace RpoHub.Worker;
++
++public sealed class RpoLegalLifecycleNormalizationWorker(
++    IRpoLegalLifecycleNormalizer normalizer,
++    IOptions<RpoOptions> options,
++    ILogger<RpoLegalLifecycleNormalizationWorker> logger) : BackgroundService
++{
++    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
++    {
++        while (!stoppingToken.IsCancellationRequested)
++        {
++            try
++            {
++                var result = await normalizer.NormalizeNextBatchAsync(
++                    options.Value.NormalizationBatchSize,
++                    stoppingToken);
++
++                if (result.LockUnavailable)
++                {
++                    await Task.Delay(options.Value.NormalizationPollInterval, stoppingToken);
++                    continue;
++                }
++
++                if (result.NormalizedRecords == 0)
++                {
++                    await Task.Delay(options.Value.NormalizationPollInterval, stoppingToken);
++                    continue;
++                }
++
++                logger.LogInformation(
++                    "Normalized legal form and lifecycle for {NormalizedRecords} RPO records: {UpsertedLifecycleRecords} lifecycle rows upserted, {InsertedLegalForms} legal forms and {QualityObservations} quality observations inserted.",
++                    result.NormalizedRecords,
++                    result.UpsertedLifecycleRecords,
++                    result.InsertedLegalForms,
++                    result.QualityObservations);
++            }
++            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
++            {
++                break;
++            }
++            catch (Exception exception)
++            {
++                logger.LogError(exception, "RPO legal-form and lifecycle normalization iteration failed; processing will resume after the polling interval.");
++                await Task.Delay(options.Value.NormalizationPollInterval, stoppingToken);
++            }
++        }
++    }
++}
+-- 
+2.51.1
+
